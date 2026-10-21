@@ -15,6 +15,8 @@ struct SearchResult {
 };
 
 std::vector<std::wstring> ParseTerms(const std::wstring& query);
+// 单个词的匹配（含通配符 * ? 时锚定整名；用于测试）。foldedTerm 须已折叠
+bool WildcardMatch(std::wstring_view s, const std::wstring& foldedTerm);
 // 返回 false 表示被取消
 bool SearchCore(const IndexData& d, const std::vector<std::wstring>& terms, std::vector<uint32_t>& out,
                 const std::function<bool()>& cancelled);

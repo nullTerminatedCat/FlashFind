@@ -19,6 +19,78 @@ std::vector<std::wstring> ParseTerms(const std::wstring& query) {
     return terms;
 }
 
+// ---------- 通配符（Everything 风格）----------
+// 含 * 或 ? 的词匹配整个名称（含 \ 时匹配完整路径），锚定首尾；不含通配符的词仍为子串匹配。
+// 每次搜索只编译一次；常见形态走无回溯快速路径。
+namespace {
+enum class PatKind : uint8_t { Substr, All, Exact, Prefix, Suffix, PrefixSuffix, Glob };
+struct Pattern {
+    PatKind kind = PatKind::Substr;
+    std::wstring a, b;       // Exact/Prefix: a；Suffix: b；PrefixSuffix: a+b；Substr: a；Glob: a = 规范化模式（连续 * 合并）
+    bool ascii = false, path = false;
+};
+
+template <bool A> inline wchar_t F(wchar_t c) { if constexpr (A) return FoldA(c); else return Fold(c); }
+
+template <bool A> inline bool EqAt(const wchar_t* s, std::wstring_view lit) {
+    for (size_t k = 0; k < lit.size(); ++k) if (F<A>(s[k]) != lit[k]) return false;
+    return true;
+}
+
+// 迭代式贪心 + 单回溯点（无递归）：最坏 O(n*m)，常见情况线性
+template <bool A> bool GlobMatch(std::wstring_view s, std::wstring_view p) {
+    size_t i = 0, j = 0, star = SIZE_MAX, mark = 0;
+    const size_t n = s.size(), m = p.size();
+    while (i < n) {
+        if (j < m && p[j] != L'*' && (p[j] == L'?' || p[j] == F<A>(s[i]))) { ++i; ++j; }
+        else if (j < m && p[j] == L'*') { star = j++; mark = i; }
+        else if (star != SIZE_MAX) { j = star + 1; i = ++mark; }
+        else return false;
+    }
+    while (j < m && p[j] == L'*') ++j;
+    return j == m;
+}
+
+Pattern Compile(const std::wstring& t) {
+    Pattern p;
+    p.path = t.find(L'\\') != std::wstring::npos;
+    p.ascii = g_fastAscii && IsAscii(t);
+    if (t.find_first_of(L"*?") == std::wstring::npos) { p.kind = PatKind::Substr; p.a = t; return p; }
+    std::wstring g; for (wchar_t c : t) if (!(c == L'*' && !g.empty() && g.back() == L'*')) g += c;   // ** -> *
+    if (g == L"*") { p.kind = PatKind::All; return p; }
+    if (g.find(L'?') == std::wstring::npos) {
+        size_t stars = std::count(g.begin(), g.end(), L'*');
+        if (stars == 0) { p.kind = PatKind::Exact; p.a = g; return p; }
+        if (stars == 1) {
+            size_t k = g.find(L'*');
+            p.a = g.substr(0, k); p.b = g.substr(k + 1);
+            p.kind = p.a.empty() ? PatKind::Suffix : (p.b.empty() ? PatKind::Prefix : PatKind::PrefixSuffix);
+            return p;
+        }
+        if (stars == 2 && g.front() == L'*' && g.back() == L'*') { p.kind = PatKind::Substr; p.a = g.substr(1, g.size() - 2); return p; }   // *x* = 包含
+    }
+    p.kind = PatKind::Glob; p.a = g;
+    return p;
+}
+
+template <bool A> inline bool MatchT(std::wstring_view s, const Pattern& p) {
+    switch (p.kind) {
+    case PatKind::All: return true;
+    case PatKind::Substr: if constexpr (A) return ContainsFoldAscii(s, p.a); else return ContainsFold(s, p.a);
+    case PatKind::Exact: return s.size() == p.a.size() && EqAt<A>(s.data(), p.a);
+    case PatKind::Prefix: return s.size() >= p.a.size() && EqAt<A>(s.data(), p.a);
+    case PatKind::Suffix: return s.size() >= p.b.size() && EqAt<A>(s.data() + s.size() - p.b.size(), p.b);
+    case PatKind::PrefixSuffix:
+        return s.size() >= p.a.size() + p.b.size() && EqAt<A>(s.data() + s.size() - p.b.size(), p.b) && EqAt<A>(s.data(), p.a);
+    case PatKind::Glob: return GlobMatch<A>(s, p.a);
+    }
+    return false;
+}
+inline bool Match(std::wstring_view s, const Pattern& p) { return p.ascii ? MatchT<true>(s, p) : MatchT<false>(s, p); }
+} // namespace
+
+bool WildcardMatch(std::wstring_view s, const std::wstring& foldedTerm) { return Match(s, Compile(foldedTerm)); }
+
 bool SearchCore(const IndexData& d, const std::vector<std::wstring>& terms, std::vector<uint32_t>& out,
                 const std::function<bool()>& cancelled) {
     const auto& order = d.byName;
@@ -29,12 +101,11 @@ bool SearchCore(const IndexData& d, const std::vector<std::wstring>& terms, std:
     if (n < 100000) nt = 1;
     std::vector<std::vector<uint32_t>> parts(nt);
     std::atomic<bool> stop{false};
-    std::vector<uint8_t> slash(terms.size()), ascii(terms.size());
-    for (size_t j = 0; j < terms.size(); ++j) {
-        slash[j] = terms[j].find(L'\\') != std::wstring::npos;
-        ascii[j] = g_fastAscii && IsAscii(terms[j]);
-    }
-    auto match = [&](std::wstring_view s, size_t j) { return ascii[j] ? ContainsFoldAscii(s, terms[j]) : ContainsFold(s, terms[j]); };
+    std::vector<Pattern> pats; pats.reserve(terms.size());
+    for (auto& t : terms) pats.push_back(Compile(t));
+    // 先测便宜的：名称词在前，路径词在后（AND 顺序无关）
+    std::stable_sort(pats.begin(), pats.end(), [](const Pattern& x, const Pattern& y) { return x.path < y.path; });
+    if (std::all_of(pats.begin(), pats.end(), [](const Pattern& p) { return p.kind == PatKind::All; })) { out = order; return true; }
     auto work = [&](unsigned t) {
         size_t b = n * t / nt, e = n * (t + 1) / nt;
         auto& o = parts[t];
@@ -44,11 +115,11 @@ bool SearchCore(const IndexData& d, const std::vector<std::wstring>& terms, std:
             uint32_t i = order[k];
             auto name = d.Name(i);
             bool ok = true; size_t flen = SIZE_MAX;
-            for (size_t j = 0; j < terms.size(); ++j) {
-                if (slash[j]) {    // 含 \ 匹配完整路径
+            for (const Pattern& p : pats) {
+                if (p.path) {    // 含 \ 匹配完整路径
                     if (flen == SIZE_MAX) { if (full.empty()) full.resize(32768); flen = d.FullPathInto(i, full.data(), full.size()); }
-                    if (!match({full.data(), flen}, j)) { ok = false; break; }
-                } else if (!match(name, j)) { ok = false; break; }
+                    if (!Match({full.data(), flen}, p)) { ok = false; break; }
+                } else if (!Match(name, p)) { ok = false; break; }
             }
             if (ok) o.push_back(i);
         }

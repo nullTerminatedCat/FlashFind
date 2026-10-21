@@ -465,6 +465,43 @@ static int SelfTest() {
     return 0;
 }
 
+// -wildtest [db]：通配符单元测试 + 大索引上的耗时
+static int WildTest(std::wstring dbPath) {
+    std::wstring out; wchar_t buf[1024]; int fails = 0;
+    auto T = [&](const wchar_t* name, const wchar_t* q, bool want) {
+        auto terms = ParseTerms(q);
+        bool got = !terms.empty() && WildcardMatch(name, terms[0]);
+        swprintf_s(buf, L"  %s %-14s ~ %-22s => %d\r\n", got == want ? L"[OK]  " : L"[FAIL]", q, name, got); out += buf;
+        if (got != want) ++fails;
+    };
+    out += L"[unit]\r\n";
+    T(L"1.exe", L"1*.exe", true);  T(L"123.EXE", L"1*.exe", true);  T(L"a1.exe", L"1*.exe", false);  T(L"1.exe.bak", L"1*.exe", false);
+    T(L"notepad.exe", L"*.exe", true); T(L"exe", L"*.exe", false); T(L".exe", L"*.exe", true); T(L"x.exe.txt", L"*.exe", false);
+    T(L"abc", L"a?c", true); T(L"aXc", L"A?C", true); T(L"ac", L"a?c", false); T(L"abbc", L"a?c", false);
+    T(L"anything", L"**", true); T(L"", L"*", true); T(L"report", L"rep*", true); T(L"xreport", L"rep*", false);
+    T(L"report.docx", L"*port*", true); T(L"report", L"report", true); T(L"my report.doc", L"report", true);
+    T(L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaab", L"*a*a*a*a*a*b", true); T(L"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", L"*a*a*a*a*a*b", false);
+    T(L"ab.c.d", L"a*.?", true); T(L"中文文件.TXT", L"中*.txt", true); T(L"Kelvin\u212A.txt", L"kelvin?.txt", true);
+    T(L"C:\\Windows\\notepad.exe", L"c:\\windows\\*.exe", true); T(L"C:\\Windows\\System32\\a.exe", L"c:\\windows\\?.exe", false);
+    InitFold(); g_fastAscii = true;
+    std::wstring err; if (dbPath.empty()) dbPath = Indexer::DefaultDbPath();
+    auto d = LoadDb(dbPath, err);
+    if (!d) { out += L"[db] 无数据库，改用合成索引\r\n"; d = Synthesize(2260000); }
+    swprintf_s(buf, L"[db] %zu 个对象，%u 线程\r\n", d->entries.size(), std::max(1u, std::min(std::thread::hardware_concurrency(), 16u))); out += buf;
+    for (const wchar_t* q : {L"exe", L".exe", L"1*.exe", L"*.exe", L"*.EXE", L"a?c", L"**", L"*a*e*.?x?", L"report *.docx", L"win*\\*.dll"}) {
+        auto terms = ParseTerms(q); std::vector<uint32_t> res; double best = 1e9, sum = 0;
+        for (int k = 0; k < 7; ++k) { double a = NowMs(); SearchCore(*d, terms, res, [] { return false; }); double t = NowMs() - a; best = std::min(best, t); sum += t; }
+        swprintf_s(buf, L"[search] %-14s results=%-8zu best=%6.2f ms avg=%6.2f ms\r\n", q, res.size(), best, sum / 7); out += buf;
+        if (std::wstring(q) == L"1*.exe") {   // 交叉验证：与逐项 GlobMatch 一致
+            size_t brute = 0; for (uint32_t id : d->byName) if (WildcardMatch(d->Name(id), terms[0])) ++brute;
+            if (brute != res.size()) { ++fails; out += L"  [FAIL] 1*.exe 结果数与逐项匹配不一致\r\n"; }
+        }
+    }
+    swprintf_s(buf, L"[result] %s (%d failed)\r\n", fails ? L"FAIL" : L"PASS", fails); out += buf;
+    WriteOut(L"ff_wildtest.txt", out);
+    return fails ? 1 : 0;
+}
+
 // -pipetest：启动 -svc-console（非服务的同一管道服务器），通过管道测试协议
 static int PipeTest(std::wstring vol) {
     std::wstring out; wchar_t buf[2048]; int fails = 0;
@@ -568,6 +605,7 @@ int App::Run(HINSTANCE inst, int show) {
         if (mode == L"-svc-console") return SvcConsole();
         if (mode == L"-install-service") return InstallService();
         if (mode == L"-uninstall-service") return UninstallService();
+        if (mode == L"-wildtest") { InitFold(); g_fastAscii = true; return WildTest(arg); }
         if (mode == L"-pipetest") { InitFold(); g_fastAscii = true; return PipeTest(arg.empty() ? L"G:" : arg); }
         if (mode == L"-incrtest" || mode == L"-initest" || mode == L"-gtest") {
             InitFold(); g_fastAscii = true;

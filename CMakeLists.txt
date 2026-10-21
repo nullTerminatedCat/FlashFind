@@ -40,4 +40,5 @@ target_link_libraries(FlashFind PRIVATE comctl32 uxtheme dwmapi shell32 shlwapi 
 enable_testing()
 add_test(NAME initest COMMAND FlashFind -initest)
 add_test(NAME incrtest COMMAND FlashFind -incrtest)
+add_test(NAME wildtest COMMAND FlashFind -wildtest ${CMAKE_BINARY_DIR}/no_such.db)
 add_test(NAME incrtest_synthetic COMMAND FlashFind -incrtest ${CMAKE_BINARY_DIR}/no_such.db)

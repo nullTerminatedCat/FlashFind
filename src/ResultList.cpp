@@ -145,8 +145,16 @@ void ResultList::DrawName(HDC dc, const RECT& rc, uint32_t i, bool selected) {
     memset(mask, 0, name.size());
     for (auto& t : res_->terms) {
         if (t.empty() || t.find(L'\\') != std::wstring::npos) continue;
-        for (size_t p = FindFold(name, t, 0); p != std::wstring_view::npos; p = FindFold(name, t, p + 1))
-            memset(mask + p, 1, std::min(t.size(), name.size() - p));
+        // 通配符词：按 * ? 拆成字面片段分别高亮
+        std::wstring_view tv(t);
+        for (size_t b = 0; b <= tv.size();) {
+            size_t e = tv.find_first_of(L"*?", b); if (e == std::wstring_view::npos) e = tv.size();
+            std::wstring_view lit = tv.substr(b, e - b);
+            if (!lit.empty())
+                for (size_t p = FindFold(name, lit, 0); p != std::wstring_view::npos; p = FindFold(name, lit, p + 1))
+                    memset(mask + p, 1, std::min(lit.size(), name.size() - p));
+            b = e + 1;
+        }
     }
     TEXTMETRICW tm; GetTextMetricsW(dc, &tm);
     int x = rc.left;
