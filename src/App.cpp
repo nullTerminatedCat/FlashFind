@@ -10,6 +10,10 @@
 #include "Fold.h"
 #include "Index.h"
 #include "Search.h"
+#include "Db.h"
+#include "MftIndexer.h"
+#include "Usn.h"
+#include <winioctl.h>
 
 namespace ff {
 
@@ -27,104 +31,310 @@ static void WriteOut(const std::wstring& name, const std::wstring& out) {
     CloseHandle(f);
 }
 
-static bool HasName(const IndexData& d, const wchar_t* n) {
-    for (uint32_t i : d.byName) if (d.Name(i) == n) return true;
-    return false;
+static size_t CountExact(const IndexData& d, std::wstring_view nm) {
+    auto it = std::lower_bound(d.byName.begin(), d.byName.end(), nm, [&](uint32_t x, std::wstring_view n) { return CompareFold(d.Name(x), n) < 0; });
+    size_t c = 0;
+    for (; it != d.byName.end() && CompareFold(d.Name(*it), nm) == 0; ++it) if (d.Name(*it) == nm) ++c;
+    return c;
+}
+static bool InByName(const IndexData& d, uint32_t id) {
+    auto it = std::lower_bound(d.byName.begin(), d.byName.end(), id, [&](uint32_t a, uint32_t b) { int c = CompareFold(d.Name(a), d.Name(b)); return c ? c < 0 : a < b; });
+    return it != d.byName.end() && *it == id;
+}
+static size_t SearchCount(const IndexData& d, const wchar_t* q) {
+    std::vector<uint32_t> res; SearchCore(d, ParseTerms(q), res, [] { return false; }); return res.size();
+}
+static double NowMs() { LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c); return c.QuadPart * 1000.0 / f.QuadPart; }
+
+// 合成索引（没有现成数据库时）：n 个对象，约 1/8 为文件夹
+static std::shared_ptr<IndexData> Synthesize(size_t n) {
+    VolumeData v; v.info.root = L"S:"; v.info.ntfs = true;
+    v.Add(L"S:", 2, kNoParent, kFlagDir, 0, 0);
+    std::vector<uint32_t> dirs{0};
+    uint64_t x = 88172645463325252ULL;
+    wchar_t nm[64];
+    for (size_t i = 1; i < n; ++i) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        bool dir = (x & 7) == 0;
+        uint32_t parent = dirs[(x >> 8) % dirs.size()];
+        int len = swprintf_s(nm, L"%s_%llx%s", dir ? L"folder" : L"file", (unsigned long long)(x >> 20) & 0xFFFFFF, dir ? L"" : L".txt");
+        uint32_t idx = v.Add(nm, len, parent, dir ? kFlagDir : 0, dir ? 0 : (x & 0xFFFFF), 0);
+        if (dir) dirs.push_back(idx);
+    }
+    std::vector<VolumeData> vols; vols.push_back(std::move(v));
+    return Merge(vols, 0);
 }
 
-static void Touch(const std::wstring& p, const char* data) {
-    HANDLE f = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
-    DWORD wr; WriteFile(f, data, static_cast<DWORD>(strlen(data)), &wr, nullptr); CloseHandle(f);
-}
-
-// -usntest G: ：中完整性下验证 USN 增量路径（种子库用带 FileId 的枚举建立，仅自检允许）
-static int UsnTest(const std::wstring& vol) {
-    wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
-    std::wstring db = std::wstring(tmp) + L"ff_usntest.db";
-    DeleteFileW(db.c_str());
-    std::wstring out; wchar_t buf[1024]; int fails = 0;
-    auto waitIdle = [](Indexer& ix) { while (ix.Busy()) Sleep(10); };
+// -incrtest [db]：在已加载（或合成）的大索引上测试 USN 增量插入/删除的正确性与耗时
+static int IncrTest(std::wstring dbPath) {
+    std::wstring out; wchar_t buf[2048]; int fails = 0;
     auto check = [&](bool ok, const wchar_t* what) { out += (ok ? L"  [OK]   " : L"  [FAIL] "); out += what; out += L"\r\n"; if (!ok) ++fails; };
-    std::wstring dir = vol + L"\\ff_usn_test";
-    Indexer::Options o; o.roots = {vol}; o.dbPath = db; o.monitor = false; o.seedTraverse = {vol}; o.excludes = {};
+    if (dbPath.empty()) dbPath = Indexer::DefaultDbPath();
+    std::wstring err;
+    double t0 = NowMs();
+    std::shared_ptr<IndexData> cur = LoadDb(dbPath, err);
+    double loadMs = NowMs() - t0;
+    if (!cur) { out += L"[load] 数据库不可用（" + err + L"），改用合成索引\r\n"; t0 = NowMs(); cur = Synthesize(2260000); loadMs = NowMs() - t0; }
+    const size_t n = cur->entries.size();
+    swprintf_s(buf, L"[load] %s entries=%zu folders=%zu files=%zu version=%u time=%.0f ms\r\n", dbPath.c_str(), n, cur->folders, cur->files, cur->dbVersion, loadMs);
+    out += buf;
+    // 合成 FRN（遍历建立的旧库没有 FRN）
+    if (cur->frn.size() != n) { cur->frn.resize(n); }
+    for (size_t i = 0; i < n; ++i) cur->frn.Mut(i) = (1ULL << 48) | (i + 16);
+    for (auto& v : cur->volumes) v.mft = true;
     {
-        Indexer ix; o.forceRebuild = true; ix.Start(nullptr, o); waitIdle(ix);
-        auto d = ix.Snapshot(); auto st = ix.Stats();
-        swprintf_s(buf, L"[seed] entries=%zu jid=%016I64X next=%I64d save=%d\r\n", d ? d->entries.size() : 0,
-                   d && !d->volumes.empty() ? d->volumes[0].journalId : 0, d && !d->volumes.empty() ? d->volumes[0].nextUsn : 0, st.fullSave);
-        out += buf;
-        check(d && !d->volumes.empty() && d->volumes[0].journalId != 0, L"种子库带 Journal ID");
+        double a = NowMs(); std::vector<uint32_t> res; auto terms = ParseTerms(L"report");
+        double best = 1e9; for (int k = 0; k < 5; ++k) { a = NowMs(); SearchCore(*cur, terms, res, [] { return false; }); best = std::min(best, NowMs() - a); }
+        swprintf_s(buf, L"[search] report results=%zu best=%.2f ms（分块条目/名称池）\r\n", res.size(), best); out += buf;
     }
-    o.seedTraverse.clear(); o.forceRebuild = false;
-    // 文件系统变化：新建目录/文件、重命名、删除、修改
-    CreateDirectoryW(dir.c_str(), nullptr);
-    Touch(dir + L"\\usn_a.txt", "a");
-    Touch(dir + L"\\usn_b.txt", "bb");
-    Touch(dir + L"\\usn_keep.txt", "k");
-    MoveFileW((dir + L"\\usn_b.txt").c_str(), (dir + L"\\usn_renamed_中文.txt").c_str());
-    DeleteFileW((dir + L"\\usn_a.txt").c_str());
-    Touch(dir + L"\\usn_keep.txt", "kkkkkkkkkk");
+    std::shared_ptr<const IndexData> base = cur;
+    const IndexData& B = *base;
+    // 选取目标（卷 0）
+    std::vector<uint32_t> direct(n, 0);
+    for (size_t i = 0; i < n; ++i) { const Entry& e = B.entries[i]; if (!e.IsDeleted() && e.parent != kNoParent) ++direct[e.parent]; }
+    uint32_t D0 = kNoParent, S = kNoParent, X = kNoParent;
+    std::vector<uint32_t> files;
+    for (uint32_t id : B.byName) {
+        const Entry& e = B.entries[id];
+        if (e.Vol() != 0 || e.parent == kNoParent) continue;
+        if (e.IsDir()) {
+            if (D0 == kNoParent && direct[id] >= 3 && direct[id] < 200) D0 = id;
+            else if (S == kNoParent && direct[id] >= 300 && direct[id] < 30000 && id != D0) S = id;
+            else if (X == kNoParent && direct[id] >= 2 && direct[id] < 100 && id != D0 && id != S) X = id;
+        } else if (files.size() < 400000) files.push_back(id);
+    }
+    auto isUnder = [&](uint32_t i, uint32_t anc) { for (uint32_t p = B.entries[i].parent; p != kNoParent; p = B.entries[p].parent) if (p == anc) return true; return false; };
+    // 改名/删除目标：不在 S、X 之下，取均匀分布的文件
+    std::vector<uint32_t> pick;
+    for (size_t k = 0; k < files.size() && pick.size() < 550; k += std::max<size_t>(1, files.size() / 600))
+        if (!isUnder(files[k], S) && !isUnder(files[k], X) && files[k] != D0) pick.push_back(files[k]);
+    if (D0 == kNoParent || S == kNoParent || X == kNoParent || pick.size() < 550) { out += L"[FAIL] 找不到测试目标\r\n"; WriteOut(L"ff_incrtest.txt", out); return 1; }
+    size_t subDirs = 0, subFiles = 0;
+    for (size_t i = 0; i < n; ++i) if (!B.entries[i].IsDeleted() && isUnder(static_cast<uint32_t>(i), S)) (B.entries[i].IsDir() ? subDirs : subFiles)++;
+    std::wstring pathX = B.FullPath(X), pathD0 = B.FullPath(D0), pathS = B.FullPath(S);
+    swprintf_s(buf, L"[targets] D0=%s\r\n  S=%s（子树 %zu 文件夹 %zu 文件）\r\n  X(排除)=%s\r\n", pathD0.c_str(), pathS.c_str(), subDirs, subFiles, pathX.c_str());
+    out += buf;
+
+    // 构造 USN_RECORD_V2 记录流
+    std::vector<UsnEvent> evs; int64_t usn = 1000; const int64_t now = 133500000000000000LL;
+    auto ev = [&](uint64_t frn, uint64_t parent, uint32_t reason, uint32_t attrs, const std::wstring& name) {
+        UsnEvent e; e.frn = frn; e.parent = parent; e.reason = reason; e.attrs = attrs; e.usn = usn; usn += 96; e.time = now; e.name = name; evs.push_back(e);
+    };
+    uint64_t nextFrn = (2ULL << 48) | (n + 1000);
+    for (int k = 0; k < 1000; ++k) { swprintf_s(buf, L"ff_incr_%04d.txt", k); ev(nextFrn++, B.frn[D0], USN_REASON_FILE_CREATE | USN_REASON_CLOSE, FILE_ATTRIBUTE_ARCHIVE, buf); }
+    uint64_t ndir = nextFrn++;
+    ev(ndir, B.frn[D0], USN_REASON_FILE_CREATE | USN_REASON_CLOSE, FILE_ATTRIBUTE_DIRECTORY, L"ff_incr_dir");
+    for (int k = 0; k < 100; ++k) { swprintf_s(buf, L"ff_incr_sub_%03d.log", k); ev(nextFrn++, ndir, USN_REASON_FILE_CREATE | USN_REASON_CLOSE, FILE_ATTRIBUTE_ARCHIVE, buf); }
+    std::vector<uint32_t> renamed(pick.begin(), pick.begin() + 200), deleted(pick.begin() + 200, pick.begin() + 500), modified(pick.begin() + 500, pick.begin() + 550);
+    for (size_t k = 0; k < renamed.size(); ++k) {
+        uint32_t id = renamed[k];
+        ev(B.frn[id], B.frn[B.entries[id].parent], USN_REASON_RENAME_OLD_NAME, FILE_ATTRIBUTE_ARCHIVE, std::wstring(B.Name(id)));
+        swprintf_s(buf, L"ff_renamed_%03zu_中文.dat", k);
+        ev(B.frn[id], B.frn[B.entries[id].parent], USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE, FILE_ATTRIBUTE_ARCHIVE, buf);
+    }
+    for (uint32_t id : deleted) ev(B.frn[id], B.frn[B.entries[id].parent], USN_REASON_FILE_DELETE | USN_REASON_CLOSE, FILE_ATTRIBUTE_ARCHIVE, std::wstring(B.Name(id)));
+    for (uint32_t id : modified) ev(B.frn[id], B.frn[B.entries[id].parent], USN_REASON_DATA_EXTEND | USN_REASON_CLOSE, FILE_ATTRIBUTE_ARCHIVE, std::wstring(B.Name(id)));
+    ev(B.frn[S], B.frn[B.entries[S].parent], USN_REASON_FILE_DELETE | USN_REASON_CLOSE, FILE_ATTRIBUTE_DIRECTORY, std::wstring(B.Name(S)));   // 只有文件夹本身的删除记录
+    ev(nextFrn++, B.frn[X], USN_REASON_FILE_CREATE | USN_REASON_CLOSE, FILE_ATTRIBUTE_ARCHIVE, L"ff_excluded_new.txt");                      // 父目录在排除列表中
+    ev((9ULL << 48) | 77, B.frn[D0], USN_REASON_FILE_DELETE, FILE_ATTRIBUTE_DIRECTORY, L"ghost_dir");                                    // 不存在的文件夹
+    ev(nextFrn++, B.frn[D0], USN_REASON_FILE_CREATE, FILE_ATTRIBUTE_ARCHIVE, L"ff_tmp_created_deleted.tmp");
+    ev(nextFrn - 1, B.frn[D0], USN_REASON_FILE_DELETE | USN_REASON_CLOSE, FILE_ATTRIBUTE_ARCHIVE, L"ff_tmp_created_deleted.tmp");
+    std::vector<uint8_t> raw;
+    for (auto& e : evs) EncodeUsnRecord(raw, e);
+    std::vector<UsnEvent> parsed; int budget = 0;
+    double tp = NowMs();
+    bool pok = ParseUsnRecords(raw.data(), raw.size(), parsed, err, budget);
+    double parseMs = NowMs() - tp;
+    swprintf_s(buf, L"[parse] ok=%d parsed=%zu events=%zu bytes=%zu err=%s\r\n", pok, parsed.size(), evs.size(), raw.size(), err.c_str()); out += buf;
+    check(pok && parsed.size() == evs.size() && parsed.size() > 1000 && parsed[1000].name == L"ff_incr_dir" && parsed[1000].frn == evs[1000].frn, L"USN_RECORD_V2 解析（名称取自记录）");
+    {   // 损坏记录
+        std::vector<uint8_t> bad(raw.begin(), raw.begin() + raw.size() / evs.size() * 0 + reinterpret_cast<USN_RECORD_V2*>(raw.data())->RecordLength);
+        auto* r = reinterpret_cast<USN_RECORD_V2*>(bad.data()); r->FileNameOffset = 8;
+        std::vector<UsnEvent> tmp; std::wstring e2; int b2 = 0;
+        check(!ParseUsnRecords(bad.data(), bad.size(), tmp, e2, b2) && e2.find(L"bad file name offset") == 0, L"bad file name offset 被拒绝");
+        r->FileNameOffset = 60; r->RecordLength = 4096;
+        e2.clear(); tmp.clear();
+        check(!ParseUsnRecords(bad.data(), bad.size(), tmp, e2, b2) && e2.find(L"bad record length") == 0, L"bad record length 被拒绝");
+    }
+
+    LiveUpdater upd(base);
+    upd.SetFilter(0, {pathX}, {});
+    double ta = NowMs();
+    upd.Apply(0, parsed, nullptr);
+    auto snap = upd.Commit();
+    double totalMs = NowMs() - ta;
+    auto s1 = upd.LastStats();
+    swprintf_s(buf, L"[batch1] %zu 条记录：解析 %.2f ms；FRN 索引(首次) %.1f ms；应用 %.1f ms；合并 %.1f ms；合计 %.1f ms\r\n"
+                    L"  新建 %zu 删除 %zu 改名 %zu 修改 %zu 丢弃 %zu 未找到 %zu；子树移除 %zu 文件夹 %zu 文件；byName 插入 %zu 移除 %zu；复制块 %zu（%.1f MB）\r\n",
+               parsed.size(), parseMs, s1.frnIndexMs, s1.applyMs - s1.frnIndexMs, s1.commitMs, totalMs,
+               s1.creates, s1.deletes, s1.renames, s1.modifies, s1.dropped, s1.notFound, s1.removedDirs, s1.removedFiles, s1.inserted, s1.removed,
+               s1.chunkClones, s1.chunkClones * 65536.0 * 32 / 1048576.0);
+    out += buf;
+    const IndexData& W = *snap;
+    // 结构校验
+    size_t alive = 0, fo = 0, fi = 0; bool sorted = true, noDel = true;
+    for (size_t i = 0; i < W.entries.size(); ++i) if (!W.entries[i].IsDeleted()) { ++alive; (W.entries[i].IsDir() ? fo : fi)++; }
+    for (size_t k = 0; k < W.byName.size(); ++k) {
+        if (W.entries[W.byName[k]].IsDeleted()) noDel = false;
+        if (k) { int c = CompareFold(W.Name(W.byName[k - 1]), W.Name(W.byName[k])); if (c > 0 || (c == 0 && W.byName[k - 1] >= W.byName[k])) sorted = false; }
+    }
+    check(sorted, L"byName 仍然有序（逐项比较）");
+    check(noDel && W.byName.size() == alive, L"byName 恰好包含全部存活对象");
+    check(W.folders == fo && W.files == fi, L"文件夹/文件计数正确");
+    check(SearchCount(W, L"ff_incr_") == 1101, L"新建 1000 + 文件夹 1 + 其中 100 个文件可搜索");
+    bool renOk = true; for (size_t k = 0; k < renamed.size(); ++k) { swprintf_s(buf, L"ff_renamed_%03zu_中文.dat", k); if (W.Name(renamed[k]) != buf || !InByName(W, renamed[k])) renOk = false; }
+    check(renOk && SearchCount(W, L"ff_renamed_") == 200, L"改名 200 个：新名可搜索、位置正确");
+    bool delOk = true; for (uint32_t id : deleted) if (!W.entries[id].IsDeleted() || InByName(W, id)) delOk = false;
+    check(delOk, L"删除 300 个：已从索引移除");
+    bool subOk = s1.removedDirs == subDirs && s1.removedFiles == subFiles;
+    for (size_t i = 0; i < W.entries.size() && subOk; ++i) if (!W.entries[i].IsDeleted() && isUnder(static_cast<uint32_t>(i), S)) subOk = false;
+    check(subOk && W.entries[S].IsDeleted(), L"文件夹删除：内存中移除整棵子树");
+    check(SearchCount(W, L"ff_excluded_new") == 0 && s1.dropped >= 1, L"排除目录下的 CREATE 被丢弃");
+    check(SearchCount(W, L"ff_tmp_created_deleted") == 0, L"同批新建后删除：不出现");
+    bool modOk = true; for (uint32_t id : modified) if (W.entries[id].mtime != static_cast<uint64_t>(now)) modOk = false;
+    check(modOk, L"MODIFY 更新修改时间");
+    check(SearchCount(B, L"ff_incr_") == 0 && B.byName.size() == base->byName.size() && CountExact(B, B.Name(S)) >= 1 && !B.entries[S].IsDeleted(), L"旧快照未被修改（写时复制）");
+
+    {   // 第二批：典型监视批次（FRN 索引已建立）
+        evs.clear();
+        for (int k = 0; k < 100; ++k) { swprintf_s(buf, L"ff_batch2_%03d.txt", k); ev(nextFrn++, W.frn[D0], USN_REASON_FILE_CREATE | USN_REASON_CLOSE, FILE_ATTRIBUTE_ARCHIVE, buf); }
+        for (int k = 0; k < 100; ++k) { uint32_t id = static_cast<uint32_t>(n + k); ev(W.frn[id], W.frn[D0], USN_REASON_FILE_DELETE | USN_REASON_CLOSE, FILE_ATTRIBUTE_ARCHIVE, std::wstring(W.Name(id))); }
+        upd.ResetStats();
+        double tb = NowMs();
+        upd.Apply(0, evs, nullptr);
+        auto snap2 = upd.Commit();
+        double ms2 = NowMs() - tb;
+        auto s2 = upd.LastStats();
+        swprintf_s(buf, L"[batch2] 100 新建 + 100 删除：应用 %.2f ms，合并 %.2f ms，合计 %.2f ms；复制块 %zu\r\n", s2.applyMs, s2.commitMs, ms2, s2.chunkClones);
+        out += buf;
+        check(SearchCount(*snap2, L"ff_batch2_") == 100 && SearchCount(*snap2, L"ff_incr_") == 1001, L"第二批结果正确");
+        // 单条（1 个新建）
+        evs.clear(); ev(nextFrn++, W.frn[D0], USN_REASON_FILE_CREATE | USN_REASON_CLOSE, FILE_ATTRIBUTE_ARCHIVE, L"ff_single.txt");
+        upd.ResetStats(); tb = NowMs(); upd.Apply(0, evs, nullptr); auto snap3 = upd.Commit(); ms2 = NowMs() - tb;
+        swprintf_s(buf, L"[batch3] 1 个新建：合计 %.2f ms\r\n", ms2); out += buf;
+        check(CountExact(*snap3, L"ff_single.txt") == 1, L"单条新建正确");
+        snap = snap3;
+    }
+    {   // 仅包含列表
+        LiveUpdater u2(snap);
+        u2.SetFilter(0, {}, {pathD0});
+        evs.clear();
+        ev(nextFrn++, snap->frn[0], USN_REASON_FILE_CREATE, FILE_ATTRIBUTE_ARCHIVE, L"ff_inc_root.txt");
+        ev(nextFrn++, snap->frn[D0], USN_REASON_FILE_CREATE, FILE_ATTRIBUTE_ARCHIVE, L"ff_inc_inside.txt");
+        u2.Apply(0, evs, nullptr);
+        auto s4 = u2.Commit();
+        check(s4 && SearchCount(*s4, L"ff_inc_inside") == 1 && SearchCount(*s4, L"ff_inc_root") == 0, L"ntfs_volume_include_onlys：范围外的 CREATE 被丢弃");
+    }
+    {   // 对比：旧做法（提取各卷 + 合并 + 整体排序）
+        double tm = NowMs();
+        std::vector<VolumeData> vols;
+        for (uint32_t vi = 0; vi < snap->volumes.size(); ++vi) vols.push_back(ExtractVolume(*snap, vi));
+        auto full = Merge(vols, 0);
+        swprintf_s(buf, L"[compare] 旧做法 提取+合并+整体排序 %.0f ms（%zu 个对象）\r\n", NowMs() - tm, full->entries.size());
+        out += buf;
+    }
+    {   // v4 保存/加载往返
+        wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
+        std::wstring db = std::wstring(tmp) + L"ff_incrtest.db";
+        uint64_t bytes = 0; double ts = NowMs();
+        bool ok = SaveDb(db, *snap, false, &bytes); double saveMs = NowMs() - ts;
+        ts = NowMs(); auto back = LoadDb(db, err); double lMs = NowMs() - ts;
+        swprintf_s(buf, L"[db v4] 保存 %.0f ms（%llu 字节），加载 %.0f ms\r\n", saveMs, bytes, lMs); out += buf;
+        check(ok && back && back->byName == snap->byName && back->entries.size() == snap->entries.size() && SearchCount(*back, L"ff_batch2_") == 100, L"v4 数据库往返一致");
+        DeleteFileW(db.c_str());
+        if (back) {
+            double a, best = 1e9; std::vector<uint32_t> res; auto terms = ParseTerms(L"report");
+            for (int k = 0; k < 5; ++k) { a = NowMs(); SearchCore(*back, terms, res, [] { return false; }); best = std::min(best, NowMs() - a); }
+            swprintf_s(buf, L"[search] 加载后 report results=%zu best=%.2f ms\r\n", res.size(), best); out += buf;
+        }
+    }
+    PROCESS_MEMORY_COUNTERS_EX pmc{sizeof(pmc)};
+    GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
+    swprintf_s(buf, L"[proc] peak_working_set=%zu MB\r\n[result] %s (%d failed)\r\n", pmc.PeakWorkingSetSize >> 20, fails ? L"FAIL" : L"PASS", fails);
+    out += buf;
+    WriteOut(L"ff_incrtest.txt", out);
+    return fails ? 1 : 0;
+}
+
+// -initest：每卷设置的 ini 并行数组往返 + 过滤规则
+static int IniTest() {
+    std::wstring out; int fails = 0;
+    auto check = [&](bool ok, const wchar_t* what) { out += (ok ? L"  [OK]   " : L"  [FAIL] "); out += what; out += L"\r\n"; if (!ok) ++fails; };
+    wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
+    std::wstring ini = std::wstring(tmp) + L"ff_initest.ini";
+    DeleteFileW(ini.c_str());
+    Settings a;
+    VolumeConfig c; c.path = L"C:"; c.guid = L"\\\\?\\Volume{11111111-2222-3333-4444-555555555555}\\";
+    VolumeConfig d; d.path = L"D:"; d.include = false; d.monitor = false; d.loadRecentChanges = true; d.enableUsnJournal = false;
+    d.includeOnly = {L"D:\\a,b", L"D:\\工作\\\"q\""};
+    VolumeConfig g; g.path = L"G:"; g.enableUsnJournal = true; g.loadRecentChanges = false;   // Journal 开、最近更改关
+    a.ntfsVolumes = {c, d, g};
+    a.SaveTo(ini);
+    Settings b; b.LoadFrom(ini, false);
+    bool same = b.ntfsVolumes.size() == 3;
+    for (size_t i = 0; same && i < 3; ++i) {
+        auto& x = a.ntfsVolumes[i]; auto& y = b.ntfsVolumes[i];
+        same = x.path == y.path && x.guid == y.guid && x.include == y.include && x.monitor == y.monitor &&
+               x.loadRecentChanges == y.loadRecentChanges && x.enableUsnJournal == y.enableUsnJournal && x.includeOnly == y.includeOnly;
+    }
+    check(same, L"7 个每卷并行数组写入后读回一致（含逗号/引号/中文）");
+    check(b.ntfsVolumes.size() == 3 && b.ntfsVolumes[2].enableUsnJournal && !b.ntfsVolumes[2].loadRecentChanges, L"Journal 开启而 load_recent_changes 关闭可以共存");
+    // ini 原文
+    HANDLE f = CreateFileW(ini.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        std::string raw(65536, 0); DWORD rd = 0; ReadFile(f, raw.data(), 65535, &rd, nullptr); raw.resize(rd); CloseHandle(f);
+        std::wstring w;
+        if (rd >= 2 && (uint8_t)raw[0] == 0xFF) w.assign(reinterpret_cast<const wchar_t*>(raw.data() + 2), (rd - 2) / 2);
+        else { int n = MultiByteToWideChar(CP_ACP, 0, raw.data(), rd, nullptr, 0); w.resize(n); MultiByteToWideChar(CP_ACP, 0, raw.data(), rd, w.data(), n); }
+        for (size_t p = 0; (p = w.find(L"ntfs_volume", p)) != std::wstring::npos;) { size_t e = w.find(L'\n', p); out += L"    " + w.substr(p, e - p) + L"\n"; p = e; }
+    }
+    // 只有排除列表变化才触发重建
+    std::vector<std::wstring> ex = {L"C:\\Windows\\WinSxS"};
+    auto vols = a.ntfsVolumes;
+    uint64_t h0 = ConfigHash(ex, vols);
+    auto vols2 = vols; VolumeConfig e; e.path = L"E:"; vols2.push_back(e);
+    check(ConfigHash(ex, vols2) == h0, L"新增卷不改变排除哈希（按卷处理，不全量重建）");
+    auto ex2 = ex; ex2.push_back(L"C:\\Temp");
+    check(ConfigHash(ex2, vols) != h0, L"排除列表变化 -> rebuild: excludes changed");
+    auto vols3 = vols; vols3[0].includeOnly = {L"C:\\work"};
+    check(ConfigHash(ex, vols3) != h0, L"仅包含列表变化 -> 重建");
+    // 路径过滤
+    std::vector<std::wstring> inc = {L"C:\\work\\src"};
+    check(PathFiltered(L"C:\\Windows\\WinSxS\\x.dll", false, ex, {}) && !PathFiltered(L"C:\\Windows\\WinSxS", true, ex, {}), L"排除目录：内容过滤，目录本身保留");
+    check(!PathFiltered(L"C:\\Windows\\WinSxSabc\\a", false, ex, {}), L"前缀相同但不是子目录不被排除");
+    check(PathFiltered(L"C:\\other.txt", false, {}, inc) && !PathFiltered(L"C:\\work", true, {}, inc) && !PathFiltered(L"C:\\WORK\\SRC\\a.c", false, {}, inc), L"仅包含：祖先文件夹保留，范围外丢弃（不区分大小写）");
+    DeleteFileW(ini.c_str());
+    out += fails ? L"[result] FAIL\r\n" : L"[result] PASS\r\n";
+    WriteOut(L"ff_initest.txt", out);
+    return fails ? 1 : 0;
+}
+
+// -gtest <卷>：中完整性真实卷：启动不重扫、NTFS 不遍历、提示需要服务/管理员
+static int GTest(const std::wstring& vol) {
+    std::wstring out; wchar_t buf[1024]; int fails = 0;
+    auto check = [&](bool ok, const wchar_t* what) { out += (ok ? L"  [OK]   " : L"  [FAIL] "); out += what; out += L"\r\n"; if (!ok) ++fails; };
+    wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
+    std::wstring db = std::wstring(tmp) + L"ff_gtest.db";
+    DeleteFileW(db.c_str());
+    Indexer::Options o; o.roots = {vol}; o.dbPath = db; o.monitor = true;
+    auto waitIdle = [](Indexer& ix) { while (ix.Busy()) Sleep(10); };
     {
-        Indexer ix; auto t = GetTickCount64(); ix.Start(nullptr, o); waitIdle(ix);
-        auto d = ix.Snapshot(); auto st = ix.Stats();
-        swprintf_s(buf, L"[usn1] total=%.3fs load=%.3fs update=%.3fs changes=%zu unresolved=%zu fullSave=%d headerOnly=%d rebuild=%.2f\r\n",
-                   (GetTickCount64() - t) / 1000.0, st.loadSec, st.updateSec, st.usnChanges, st.usnUnresolved, st.fullSave, st.headerOnlyUpdate, st.rebuildSec);
-        out += buf;
-        if (!st.note.empty()) out += L"  [note] " + st.note + L"\r\n";
-        check(st.loadedFromDb && st.rebuildSec < 0, L"启动只加载数据库，没有重扫");
-        check(d && HasName(*d, L"ff_usn_test"), L"新目录 ff_usn_test 出现");
-        check(d && HasName(*d, L"usn_renamed_中文.txt"), L"重命名后的 usn_renamed_中文.txt 出现");
-        check(d && !HasName(*d, L"usn_b.txt"), L"旧名 usn_b.txt 消失");
-        check(d && !HasName(*d, L"usn_a.txt"), L"已删除 usn_a.txt 消失");
-        bool sizeOk = false;
-        if (d) for (uint32_t i : d->byName) if (d->Name(i) == L"usn_keep.txt") { sizeOk = d->entries[i].size == 10; out += L"  path=" + d->FullPath(i) + L"\r\n"; }
-        check(sizeOk, L"usn_keep.txt 大小更新为 10");
-        check(st.fullSave, L"记录有变化 -> 整库保存");
-    }
-    {   // 没有任何变化：既不合并也不写文件
-        Indexer ix; ix.Start(nullptr, o); waitIdle(ix);
-        auto st = ix.Stats();
-        swprintf_s(buf, L"[usn2] load=%.3fs update=%.3fs changes=%zu fullSave=%d headerOnly=%d\r\n", st.loadSec, st.updateSec, st.usnChanges, st.fullSave, st.headerOnlyUpdate);
-        out += buf;
-        check(!st.fullSave && !st.headerOnlyUpdate && st.rebuildSec < 0, L"无变化 -> 不保存、不重扫");
-    }
-    // 只有不影响索引的日志记录（新建后立即删除）：游标前进，只原地更新卷表
-    Touch(dir + L"\\usn_tmp.txt", "t"); DeleteFileW((dir + L"\\usn_tmp.txt").c_str());
-    {
-        WIN32_FILE_ATTRIBUTE_DATA before{}; GetFileAttributesExW(db.c_str(), GetFileExInfoStandard, &before);
-        Indexer ix; ix.Start(nullptr, o); waitIdle(ix);
-        auto st = ix.Stats();
-        WIN32_FILE_ATTRIBUTE_DATA after{}; GetFileAttributesExW(db.c_str(), GetFileExInfoStandard, &after);
-        swprintf_s(buf, L"[usn3] changes=%zu fullSave=%d headerOnly=%d save=%.4fs\r\n", st.usnChanges, st.fullSave, st.headerOnlyUpdate, st.saveSec);
-        out += buf;
-        check(!st.fullSave && st.headerOnlyUpdate, L"游标前进但无记录变化 -> 只更新头部");
-        check(memcmp(&before.ftCreationTime, &after.ftCreationTime, sizeof(FILETIME)) == 0, L"数据库文件未被替换（创建时间不变）");
-    }
-    {   // 头部原地更新后能再次加载，且游标已前进
         Indexer ix; ix.Start(nullptr, o); waitIdle(ix);
         auto st = ix.Stats(); auto d = ix.Snapshot();
-        check(st.loadedFromDb && !st.fullSave && !st.headerOnlyUpdate && d && HasName(*d, L"usn_renamed_中文.txt"), L"更新头部后的数据库可加载，且无重复变化");
-    }
-    {   // 监视：运行中的变化被应用
-        Indexer ix; auto om = o; om.monitor = true; ix.Start(nullptr, om);
-        while (ix.Busy()) Sleep(10);
-        Touch(dir + L"\\usn_live.txt", "live");
-        bool seen = false;
-        for (int k = 0; k < 100 && !seen; ++k) { Sleep(100); auto d = ix.Snapshot(); seen = d && HasName(*d, L"usn_live.txt"); }
-        check(seen, L"监视线程 10 秒内应用了 usn_live.txt");
+        swprintf_s(buf, L"[fresh] entries=%zu rebuild=%.3fs note=%s\r\n", d ? d->entries.size() : 0, st.rebuildSec, st.note.c_str()); out += buf;
+        check(d && d->entries.size() == 1 && !st.note.empty(), MftIndexer::IsElevated() ? L"（已提升）" : L"未提升：NTFS 卷不遍历，只有卷根并提示服务/管理员");
         ix.Stop();
     }
-    // 清理
-    for (auto n : {L"usn_keep.txt", L"usn_renamed_中文.txt", L"usn_live.txt"}) DeleteFileW((dir + L"\\" + n).c_str());
-    RemoveDirectoryW(dir.c_str());
-    {   // 删除也能被应用
+    {
         Indexer ix; ix.Start(nullptr, o); waitIdle(ix);
-        auto d = ix.Snapshot();
-        check(d && !HasName(*d, L"ff_usn_test") && !HasName(*d, L"usn_keep.txt"), L"清理后的删除被应用");
+        auto st = ix.Stats();
+        swprintf_s(buf, L"[restart] loaded=%d load=%.4fs rebuild=%.2f fullSave=%d\r\n", st.loadedFromDb, st.loadSec, st.rebuildSec, st.fullSave); out += buf;
+        check(st.loadedFromDb && st.rebuildSec < 0, L"重启只加载数据库，没有重扫");
+        ix.Stop();
     }
-    swprintf_s(buf, L"[result] %s (%d failed)\r\n", fails ? L"FAIL" : L"PASS", fails);
-    out += buf;
-    WriteOut(L"ff_usntest.txt", out);
+    DeleteFileW(db.c_str());
+    out += fails ? L"[result] FAIL\r\n" : L"[result] PASS\r\n";
+    WriteOut(L"ff_gtest.txt", out);
     return fails ? 1 : 0;
 }
 
@@ -150,7 +360,7 @@ static int SelfTest() {
         out += buf;
         if (d) {
             swprintf_s(buf, L"[mem] entries=%zu folders=%zu files=%zu name_chars=%zu index_bytes=%zu bytes/object=%.1f\r\n",
-                       d->entries.size(), d->folders, d->files, d->names.size(), d->MemoryBytes(), double(d->MemoryBytes()) / d->entries.size());
+                       d->entries.size(), d->folders, d->files, d->names.Used(), d->MemoryBytes(), double(d->MemoryBytes()) / d->entries.size());
             out += buf;
         }
         if (!st.note.empty()) out += L"[note] " + st.note + L"\r\n";
@@ -192,12 +402,16 @@ static int SelfTest() {
 
 int App::Run(HINSTANCE inst, int show) {
     g_inst = inst;
-    if (wcsstr(GetCommandLineW(), L"-usntest")) {
-        InitFold();
+    {
         int argc = 0; LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-        std::wstring v = argc >= 3 ? argv[2] : L"G:";
+        std::wstring mode = argc >= 2 ? argv[1] : L"", arg = argc >= 3 ? argv[2] : L"";
         LocalFree(argv);
-        return UsnTest(v);
+        if (mode == L"-incrtest" || mode == L"-initest" || mode == L"-gtest") {
+            InitFold(); g_fastAscii = true;
+            if (mode == L"-incrtest") return IncrTest(arg);
+            if (mode == L"-initest") return IniTest();
+            return GTest(arg.empty() ? L"G:" : arg);
+        }
     }
     if (wcsstr(GetCommandLineW(), L"-selftest")) return SelfTest();
     // 单实例：已有实例则让它显示后退出

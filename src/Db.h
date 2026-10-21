@@ -4,7 +4,7 @@
 #include "Index.h"
 
 namespace ff {
-constexpr uint32_t kDbVersion = 3;   // 仍可读取 v2（无 Journal 信息，按过期处理）
+constexpr uint32_t kDbVersion = 4;   // 分块名称池；仍可读取 v2（无 Journal 信息，按过期处理）与 v3
 bool SaveDb(const std::wstring& path, const IndexData& d, bool compress, uint64_t* bytesWritten);
 // 失败原因写入 err（损坏 / 版本不符 / 不存在）
 // 无记录变化时只原地更新卷表（Journal ID + Next USN），不重写数据

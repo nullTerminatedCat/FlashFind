@@ -56,6 +56,8 @@ struct Reader {
     }
 };
 
+static size_t n2(const std::vector<uint8_t>* p) { return p->size(); }
+
 static std::vector<uint8_t> BuildVolTable(const std::vector<VolumeInfo>& vols) {
     std::vector<uint8_t> b(sizeof(VolTableHeader) + vols.size() * sizeof(VolSlot));
     auto* th = reinterpret_cast<VolTableHeader*>(b.data());
@@ -103,14 +105,17 @@ bool UpdateDbVolumes(const std::wstring& path, const std::vector<VolumeInfo>& vo
 
 bool SaveDb(const std::wstring& path, const IndexData& d, bool compress, uint64_t* bytesWritten) {
     Writer w;
-    w.b.reserve(d.entries.size() * sizeof(Entry) + d.names.size() * 2 + d.byName.size() * 4 + d.frn.size() * 8 + 4096);
+    // v4：条目/FRN 为逻辑连续数组（按块写出）；名称池按 1M 字符块写出（含块尾填充），加载时可直接按块装入
+    const size_t namesUsed = d.names.Used();
+    w.b.reserve(d.entries.size() * sizeof(Entry) + namesUsed * 2 + d.byName.size() * 4 + d.frn.size() * 8 + 4096);
     w.Put<uint64_t>(d.folders); w.Put<uint64_t>(d.files);
-    w.Put<uint64_t>(d.entries.size()); w.Put<uint64_t>(d.names.size());
+    w.Put<uint64_t>(d.entries.size()); w.Put<uint64_t>(namesUsed);
     w.Put<uint64_t>(d.byName.size()); w.Put<uint64_t>(d.frn.size());
-    w.Raw(d.entries.data(), d.entries.size() * sizeof(Entry));
-    w.Raw(d.names.data(), d.names.size() * 2);
+    d.entries.ForEachChunk([&](const Entry* p, size_t n) { w.Raw(p, n * sizeof(Entry)); });
+    for (size_t c = 0; c * NamePool::kChunk < namesUsed; ++c)
+        w.Raw(d.names.ChunkPtr(c), std::min(NamePool::kChunk, namesUsed - c * NamePool::kChunk) * 2);
     w.Raw(d.byName.data(), d.byName.size() * 4);
-    w.Raw(d.frn.data(), d.frn.size() * 8);
+    d.frn.ForEachChunk([&](const uint64_t* p, size_t n) { w.Raw(p, n * 8); });
 
     std::vector<uint8_t> packed;
     const std::vector<uint8_t>* payload = &w.b;
@@ -161,7 +166,7 @@ std::shared_ptr<IndexData> LoadDb(const std::wstring& path, std::wstring& err) {
     DbHeader h{}; DWORD rd = 0;
     if (sz.QuadPart < static_cast<LONGLONG>(sizeof(h)) || !ReadFile(f, &h, sizeof(h), &rd, nullptr) || rd != sizeof(h) ||
         memcmp(h.magic, "FFDB", 4) != 0) { CloseHandle(f); err = L"文件头损坏"; return nullptr; }
-    if (h.version != kDbVersion && h.version != 2) { CloseHandle(f); err = L"版本不符"; return nullptr; }
+    if (h.version != kDbVersion && h.version != 2 && h.version != 3) { CloseHandle(f); err = L"版本不符"; return nullptr; }
     const bool v2 = h.version == 2;
     if (v2) h.headerSize = sizeof(DbHeader);
     if (h.headerSize < sizeof(DbHeader) || h.headerSize > 1 << 16 ||
@@ -217,11 +222,47 @@ std::shared_ptr<IndexData> LoadDb(const std::wstring& path, std::wstring& err) {
     d->volumes = std::move(vols);
     d->folders = r.Get<uint64_t>(); d->files = r.Get<uint64_t>();
     uint64_t ne = r.Get<uint64_t>(), nc = r.Get<uint64_t>(), nb = r.Get<uint64_t>(), nf = r.Get<uint64_t>();
-    r.Array(d->entries, ne); r.Array(d->names, nc); r.Array(d->byName, nb); r.Array(d->frn, nf);
-    if (!r.ok || r.pos != r.n || nb > ne || (nf && nf != ne)) { err = L"结构不符（损坏）"; return nullptr; }
-    // 轻量一致性检查：越界即视为损坏
-    for (auto& e : d->entries)
-        if (static_cast<uint64_t>(e.nameOff) + e.nameLen > nc || (e.parent != kNoParent && e.parent >= ne)) { err = L"条目越界（损坏）"; return nullptr; }
+    if (!r.ok || ne > (n2(payload) / sizeof(Entry)) || nc > n2(payload) / 2 || nb > ne || (nf && nf != ne)) { err = L"结构不符（损坏）"; return nullptr; }
+    auto take = [&](size_t bytes) -> const uint8_t* { if (!r.ok || bytes > r.n - r.pos) { r.ok = false; return nullptr; } auto q = r.p + r.pos; r.pos += bytes; return q; };
+    const Entry* ents = reinterpret_cast<const Entry*>(take(ne * sizeof(Entry)));
+    const wchar_t* nm = reinterpret_cast<const wchar_t*>(take(nc * 2));
+    const uint32_t* bn = reinterpret_cast<const uint32_t*>(take(nb * 4));
+    const uint64_t* fr = reinterpret_cast<const uint64_t*>(take(nf * 8));
+    if (!r.ok || r.pos != r.n) { err = L"结构不符（损坏）"; return nullptr; }
+    // 条目是对齐不保证的字节流：按块 memcpy
+    d->entries.resize(ne);
+    for (size_t c = 0; c * CowArray<Entry>::kChunk < ne; ++c)
+        memcpy(d->entries.ChunkPtr(c), reinterpret_cast<const uint8_t*>(ents) + c * CowArray<Entry>::kChunk * sizeof(Entry),
+               std::min<size_t>(CowArray<Entry>::kChunk, ne - c * CowArray<Entry>::kChunk) * sizeof(Entry));
+    if (nf) {
+        d->frn.resize(nf);
+        for (size_t c = 0; c * CowArray<uint64_t>::kChunk < nf; ++c)
+            memcpy(d->frn.ChunkPtr(c), reinterpret_cast<const uint8_t*>(fr) + c * CowArray<uint64_t>::kChunk * 8,
+                   std::min<size_t>(CowArray<uint64_t>::kChunk, nf - c * CowArray<uint64_t>::kChunk) * 8);
+    }
+    d->byName.resize(nb);
+    memcpy(d->byName.data(), bn, nb * 4);
+    if (h.version >= 4) {
+        for (size_t c = 0; c * NamePool::kChunk < nc; ++c) {
+            d->names.AddChunk();
+            memcpy(d->names.ChunkPtr(c), reinterpret_cast<const uint8_t*>(nm) + c * NamePool::kChunk * 2, std::min<size_t>(NamePool::kChunk, nc - c * NamePool::kChunk) * 2);
+        }
+        d->names.SetUsed(nc);
+        for (size_t i = 0; i < ne; ++i) {
+            const Entry& e = d->entries[i];
+            if (static_cast<uint64_t>(e.nameOff) + e.nameLen > nc || (e.nameOff & NamePool::kMask) + e.nameLen > NamePool::kChunk ||
+                (e.parent != kNoParent && e.parent >= ne)) { err = L"条目越界（损坏）"; return nullptr; }
+        }
+    } else {
+        // v2/v3：连续名称池 -> 分块名称池（一次性转换，下次保存为 v4）
+        for (size_t i = 0; i < ne; ++i) {
+            Entry& e = d->entries.Mut(i);
+            if (static_cast<uint64_t>(e.nameOff) + e.nameLen > nc || (e.parent != kNoParent && e.parent >= ne)) { err = L"条目越界（损坏）"; return nullptr; }
+            wchar_t tmp[0x10000];
+            memcpy(tmp, reinterpret_cast<const uint8_t*>(nm) + static_cast<size_t>(e.nameOff) * 2, e.nameLen * 2);
+            e.nameOff = d->names.Append(tmp, e.nameLen);
+        }
+    }
     for (auto i : d->byName) if (i >= ne) { err = L"排序表越界（损坏）"; return nullptr; }
     return d;
 }

@@ -23,7 +23,8 @@ add_executable(FlashFind WIN32
     src/Dpi.h
     src/Util.h
     src/ServiceClient.cpp src/ServiceClient.h
-    src/MftIndexer.cpp src/MftIndexer.h
+    src/MftIndexer.cpp
+    src/Usn.cpp src/Usn.h
     resources/FlashFind.rc
 )
 

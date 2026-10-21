@@ -66,119 +66,50 @@ bool MftIndexer::QueryJournal(const std::wstring& root, bool create, uint64_t& j
     return true;
 }
 
-bool MftIndexer::ReadChanges(const std::wstring& root, uint64_t journalId, int64_t from, int64_t& next,
-                             std::unordered_map<uint64_t, UsnChange>& out, std::wstring& err) {
-    uint64_t jid = 0; int64_t first = 0, end = 0;
-    if (!QueryJournal(root, false, jid, first, end, err)) return false;
-    if (jid != journalId) { err = L"Journal ID changed"; return false; }
-    if (from < first) { err = L"游标已被 Journal 截断"; return false; }
-    next = from;
-    if (from >= end) return true;
-    const bool priv = IsElevated();
-    HANDLE h = priv ? OpenVolume(root, GENERIC_READ) : OpenRoot(root);
-    if (h == INVALID_HANDLE_VALUE) { err = ErrText(L"打开卷/根目录"); return false; }
-    READ_USN_JOURNAL_DATA_V1 rd{};
+HANDLE MftIndexer::OpenVolumeRead(const std::wstring& root) { return OpenVolume(root, GENERIC_READ); }
+
+uint32_t MftIndexer::RecordSize(HANDLE vol) {
+    NTFS_VOLUME_DATA_BUFFER nv{}; DWORD got = 0;
+    if (!DeviceIoControl(vol, FSCTL_GET_NTFS_VOLUME_DATA, nullptr, 0, &nv, sizeof(nv), &got, nullptr)) return 1024;
+    return nv.BytesPerFileRecordSegment;
+}
+
+DWORD MftIndexer::ReadUsn(HANDLE vol, uint64_t journalId, int64_t& from, std::vector<UsnEvent>& out, std::wstring& err) {
+    READ_USN_JOURNAL_DATA_V0 rd{};
     rd.StartUsn = from; rd.ReasonMask = 0xFFFFFFFF; rd.UsnJournalID = journalId;
-    rd.MinMajorVersion = 2; rd.MaxMajorVersion = 2;
-    const DWORD code = priv ? FSCTL_READ_USN_JOURNAL : FSCTL_READ_UNPRIVILEGED_USN_JOURNAL;
     std::vector<uint8_t> buf(1 << 20);
-    DWORD got = 0;
-    while (rd.StartUsn < end) {
-        if (!DeviceIoControl(h, code, &rd, sizeof(rd), buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr)) {
-            err = ErrText(priv ? L"FSCTL_READ_USN_JOURNAL" : L"FSCTL_READ_UNPRIVILEGED_USN_JOURNAL");
-            CloseHandle(h); return false;
+    int logBudget = 200;
+    for (int iter = 0; iter < 4096 && out.size() < 1000000; ++iter) {
+        DWORD got = 0;
+        if (!DeviceIoControl(vol, FSCTL_READ_USN_JOURNAL, &rd, sizeof(rd), buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr)) {
+            DWORD e = GetLastError();
+            if (e == ERROR_JOURNAL_ENTRY_DELETED || e == ERROR_JOURNAL_NOT_ACTIVE || e == ERROR_JOURNAL_DELETE_IN_PROGRESS) return e;
+            USN_JOURNAL_DATA_V0 jd{}; DWORD g2 = 0;
+            if (DeviceIoControl(vol, FSCTL_QUERY_USN_JOURNAL, nullptr, 0, &jd, sizeof(jd), &g2, nullptr) &&
+                (jd.UsnJournalID != journalId || rd.StartUsn < jd.FirstUsn)) return ERROR_JOURNAL_ENTRY_DELETED;
+            return e ? e : ERROR_GEN_FAILURE;
         }
         if (got < sizeof(USN)) break;
-        for (DWORD off = sizeof(USN); off + sizeof(USN_RECORD_V2) <= got;) {
-            auto* rec = reinterpret_cast<USN_RECORD_V2*>(buf.data() + off);
-            if (rec->RecordLength == 0) break;
-            if (rec->MajorVersion == 2 && rec->Usn < end) {
-                auto& c = out[rec->FileReferenceNumber];
-                c.parent = rec->ParentFileReferenceNumber;
-                c.attrs = rec->FileAttributes;
-                c.reasons |= rec->Reason;
-                c.deleted = (rec->Reason & USN_REASON_FILE_DELETE) != 0;
-                if (rec->FileNameLength)
-                    c.name.assign(reinterpret_cast<const wchar_t*>(reinterpret_cast<uint8_t*>(rec) + rec->FileNameOffset), rec->FileNameLength / 2);
-            }
-            off += rec->RecordLength;
-        }
-        USN n = *reinterpret_cast<USN*>(buf.data());
-        if (n <= rd.StartUsn) break;
-        rd.StartUsn = n;
+        USN next; memcpy(&next, buf.data(), sizeof(USN));
+        if (got > sizeof(USN) && !ParseUsnRecords(buf.data() + sizeof(USN), got - sizeof(USN), out, err, logBudget)) return ERROR_INVALID_DATA;
+        if (next <= rd.StartUsn) break;
+        rd.StartUsn = next;
+        if (got <= sizeof(USN)) break;
     }
-    CloseHandle(h);
-    next = std::max<int64_t>(rd.StartUsn, end);
-    return true;
+    from = rd.StartUsn;
+    return 0;
 }
 
-// OpenFileById：取最后一段名称、大小、修改时间、属性（中完整性下对可访问的文件有效）
-static bool InfoById(HANDLE hint, uint64_t frn, std::wstring& name, uint64_t& size, uint64_t& mtime, uint32_t& attrs) {
-    FILE_ID_DESCRIPTOR d{};
-    d.dwSize = sizeof(d); d.Type = FileIdType; d.FileId.QuadPart = static_cast<LONGLONG>(frn);
-    HANDLE h = OpenFileById(hint, &d, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, FILE_FLAG_BACKUP_SEMANTICS);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    alignas(8) uint8_t nb[sizeof(FILE_NAME_INFO) + 65536];
-    bool ok = GetFileInformationByHandleEx(h, FileNameInfo, nb, sizeof(nb)) != FALSE;
-    if (ok) {
-        auto* fi = reinterpret_cast<FILE_NAME_INFO*>(nb);
-        std::wstring_view p(fi->FileName, fi->FileNameLength / 2);
-        auto s = p.rfind(L'\\');
-        name.assign(s == std::wstring_view::npos ? p : p.substr(s + 1));
-    }
-    FILE_BASIC_INFO bi{}; FILE_STANDARD_INFO si{};
-    if (GetFileInformationByHandleEx(h, FileBasicInfo, &bi, sizeof(bi))) { mtime = static_cast<uint64_t>(bi.LastWriteTime.QuadPart); attrs = bi.FileAttributes; }
-    if (GetFileInformationByHandleEx(h, FileStandardInfo, &si, sizeof(si))) size = static_cast<uint64_t>(si.EndOfFile.QuadPart);
-    CloseHandle(h);
-    return ok && !name.empty();
-}
-
-size_t MftIndexer::Apply(VolumeData& v, const std::unordered_map<uint64_t, UsnChange>& changes, size_t* unresolved) {
-    size_t n = 0; if (unresolved) *unresolved = 0;
-    if (v.frn.size() != v.entries.size()) return 0;
-    std::unordered_map<uint64_t, uint32_t> map;
-    map.reserve(v.entries.size() + changes.size());
-    for (uint32_t i = 0; i < v.entries.size(); ++i) if (!v.entries[i].IsDeleted()) map.emplace(v.frn[i], i);
-    HANDLE hint = OpenRoot(v.info.root);
-    std::vector<std::pair<uint32_t, uint64_t>> fix;
-    for (auto& [frn, c] : changes) {
-        auto it = map.find(frn);
-        if (c.deleted) {
-            if (it != map.end() && it->second != 0) { v.entries[it->second].flags |= kFlagDeleted; map.erase(it); ++n; }
-            continue;
-        }
-        std::wstring name; uint64_t size = 0, mtime = 0; uint32_t attrs = c.attrs;
-        bool got = hint != INVALID_HANDLE_VALUE && InfoById(hint, frn, name, size, mtime, attrs);
-        if (!got) name = c.name;
-        bool dir = attrs & FILE_ATTRIBUTE_DIRECTORY;
-        uint32_t idx;
-        if (it != map.end()) {
-            idx = it->second;
-            if (idx == 0) continue;   // 卷根
-            Entry& e = v.entries[idx];
-            if (!name.empty() && std::wstring_view(v.names.data() + e.nameOff, e.nameLen) != name) {
-                e.nameOff = static_cast<uint32_t>(v.names.size());
-                e.nameLen = static_cast<uint16_t>(std::min<size_t>(name.size(), 0xFFFF));
-                v.names.insert(v.names.end(), name.begin(), name.begin() + e.nameLen);
-            }
-            e.flags = static_cast<uint16_t>((e.flags & ~kFlagDir) | (dir ? kFlagDir : 0));
-            if (got) { e.size = dir ? 0 : size; e.mtime = mtime; }
-        } else {
-            if (name.empty()) { if (unresolved) ++*unresolved; continue; }
-            idx = v.Add(name.c_str(), name.size(), kNoParent, dir ? kFlagDir : 0, dir ? 0 : size, mtime);
-            v.frn.push_back(frn);
-            map.emplace(frn, idx);
-        }
-        fix.emplace_back(idx, c.parent);
-        ++n;
-    }
-    if (hint != INVALID_HANDLE_VALUE) CloseHandle(hint);
-    for (auto& [idx, parent] : fix) {
-        auto it = map.find(parent);   // 完整 64 位比较
-        if (it == map.end() || it->second == idx) v.entries[idx].flags |= kFlagDeleted;
-        else v.entries[idx].parent = it->second;
-    }
-    return n;
+static bool GetRecord(HANDLE vol, uint32_t recSize, uint64_t recNo, std::vector<uint8_t>& rec, uint64_t* gotRef) {
+    NTFS_FILE_RECORD_INPUT_BUFFER in{}; in.FileReferenceNumber.QuadPart = static_cast<LONGLONG>(recNo & kRecMask);
+    std::vector<uint8_t> out(sizeof(NTFS_FILE_RECORD_OUTPUT_BUFFER) + recSize);
+    DWORD got = 0;
+    if (!DeviceIoControl(vol, FSCTL_GET_NTFS_FILE_RECORD, &in, sizeof(in), out.data(), static_cast<DWORD>(out.size()), &got, nullptr)) return false;
+    auto* o = reinterpret_cast<NTFS_FILE_RECORD_OUTPUT_BUFFER*>(out.data());
+    if (gotRef) *gotRef = static_cast<uint64_t>(o->FileReferenceNumber.QuadPart);
+    if ((static_cast<uint64_t>(o->FileReferenceNumber.QuadPart) & kRecMask) != (recNo & kRecMask)) return false;   // 记录未使用时返回更低的记录号
+    rec.assign(o->FileRecordBuffer, o->FileRecordBuffer + std::min<DWORD>(o->FileRecordLength, recSize));
+    return rec.size() >= 0x30 && memcmp(rec.data(), "FILE", 4) == 0;
 }
 
 // ---------------- $MFT 顺序读取 ----------------
@@ -199,8 +130,8 @@ bool Fixup(uint8_t* r, uint32_t recSize, uint32_t sector) {
     return true;
 }
 
-bool ParseRuns(const uint8_t* p, const uint8_t* end, std::vector<Run>& runs) {
-    int64_t vcn = 0, lcn = 0;
+bool ParseRuns(const uint8_t* p, const uint8_t* end, std::vector<Run>& runs, int64_t startVcn = 0) {
+    int64_t vcn = startVcn, lcn = 0;
     while (p < end && *p) {
         uint8_t ls = *p & 0xF, os = *p >> 4; ++p;
         if (ls == 0 || ls > 8 || os > 8 || p + ls + os > end) return false;
@@ -219,9 +150,45 @@ bool ParseRuns(const uint8_t* p, const uint8_t* end, std::vector<Run>& runs) {
 struct Rec {
     uint64_t parent = 0, size = 0, mtime = 0;
     uint32_t nameOff = 0; uint16_t nameLen = 0; uint16_t seq = 0;
-    uint8_t inUse = 0, dir = 0, nameRank = 0, hasSize = 0;
+    uint8_t inUse = 0, dir = 0, nameRank = 0, hasSize = 0, ext = 0, hasAL = 0;
 };
+
+// FSCTL_GET_NTFS_FILE_RECORD 返回的记录可能已修正；修正失败不视为错误
+void TryFixup(std::vector<uint8_t>& r, uint32_t sector) { std::vector<uint8_t> c = r; if (Fixup(c.data(), static_cast<uint32_t>(c.size()), sector)) r.swap(c); }
+
+// 在一条记录中找无名 $DATA；回调 (resident, attrPtr, attrLen)
+template <class F> void ForEachAttr(const uint8_t* r, uint32_t recSize, F&& f) {
+    uint16_t ao; memcpy(&ao, r + 0x14, 2);
+    for (uint32_t a = ao; a + 16 <= recSize;) {
+        uint32_t type, alen; memcpy(&type, r + a, 4); if (type == 0xFFFFFFFF) break;
+        memcpy(&alen, r + a + 4, 4); if (alen < 16 || a + alen > recSize) break;
+        f(type, r + a, alen);
+        a += alen;
+    }
+}
 } // namespace
+
+bool MftIndexer::LookupRecord(HANDLE vol, uint32_t recSize, uint64_t frn, uint64_t& size, uint64_t& mtime) {
+    std::vector<uint8_t> rec;
+    if (!GetRecord(vol, recSize, frn, rec, nullptr)) return false;
+    uint16_t seq; memcpy(&seq, rec.data() + 0x10, 2);
+    if (seq != static_cast<uint16_t>(frn >> 48)) return false;   // 完整 64 位身份
+    TryFixup(rec, 512);
+    bool any = false;
+    ForEachAttr(rec.data(), static_cast<uint32_t>(rec.size()), [&](uint32_t type, const uint8_t* a, uint32_t alen) {
+        uint8_t nonres = a[8], anl = a[9];
+        if (!nonres) {
+            uint32_t vl; uint16_t vo; memcpy(&vl, a + 0x10, 4); memcpy(&vo, a + 0x14, 2);
+            if (vo + vl > alen) return;
+            if (type == 0x10 && vl >= 16) { memcpy(&mtime, a + vo + 8, 8); any = true; }
+            else if (type == 0x80 && anl == 0) { size = vl; any = true; }
+        } else if (type == 0x80 && anl == 0 && alen >= 0x38) {
+            uint64_t lowVcn; memcpy(&lowVcn, a + 0x10, 8);
+            if (lowVcn == 0) { memcpy(&size, a + 0x30, 8); any = true; }
+        }
+    });
+    return any;
+}
 
 bool MftIndexer::Build(VolumeData& v, bool enableUsn, std::atomic<bool>& stop, std::atomic<size_t>& progress, std::wstring& err) {
     HANDLE vol = OpenVolume(v.info.root, GENERIC_READ);
@@ -245,22 +212,65 @@ bool MftIndexer::Build(VolumeData& v, bool enableUsn, std::atomic<bool>& stop, s
     }
     std::vector<Run> runs;
     bool hasAttrList = false;
-    {
-        uint16_t ao; memcpy(&ao, r0.data() + 0x14, 2);
-        for (uint32_t a = ao; a + 16 <= recSize;) {
-            uint32_t type, alen; memcpy(&type, r0.data() + a, 4); if (type == 0xFFFFFFFF) break;
-            memcpy(&alen, r0.data() + a + 4, 4); if (alen < 16 || a + alen > recSize) break;
-            if (type == 0x20) hasAttrList = true;
-            if (type == 0x80 && r0[a + 8] && r0[a + 9] == 0) {
-                uint16_t ro; memcpy(&ro, r0.data() + a + 0x20, 2);
-                ParseRuns(r0.data() + a + ro, r0.data() + a + alen, runs);
+    std::vector<uint8_t> alist;
+    ForEachAttr(r0.data(), recSize, [&](uint32_t type, const uint8_t* a, uint32_t alen) {
+        uint8_t nonres = a[8], anl = a[9];
+        if (type == 0x20) {
+            hasAttrList = true;
+            if (!nonres) {
+                uint32_t vl; uint16_t vo; memcpy(&vl, a + 0x10, 4); memcpy(&vo, a + 0x14, 2);
+                if (vo + vl <= alen) alist.assign(a + vo, a + vo + vl);
+            } else {   // 非常驻属性列表：按其运行读取
+                std::vector<Run> lr; uint16_t ro; memcpy(&ro, a + 0x20, 2);
+                uint64_t dsz; memcpy(&dsz, a + 0x30, 8);
+                if (ParseRuns(a + ro, a + alen, lr)) {
+                    std::vector<uint8_t> tmp;
+                    for (auto& r : lr) {
+                        if (r.sparse) break;
+                        size_t at = tmp.size(); tmp.resize(at + static_cast<size_t>(r.len * cluster));
+                        if (!readAt(r.lcn * cluster, tmp.data() + at, static_cast<DWORD>(r.len * cluster))) { tmp.clear(); break; }
+                    }
+                    if (tmp.size() >= dsz) { tmp.resize(static_cast<size_t>(dsz)); alist.swap(tmp); }
+                }
             }
-            a += alen;
         }
+        if (type == 0x80 && nonres && anl == 0) {
+            uint16_t ro; memcpy(&ro, a + 0x20, 2); uint64_t lowVcn; memcpy(&lowVcn, a + 0x10, 8);
+            ParseRuns(a + ro, a + alen, runs, static_cast<int64_t>(lowVcn));
+        }
+    });
+    if (hasAttrList) {
+        // $ATTRIBUTE_LIST：$DATA 的后续段在扩展记录中，逐个读取并累积 mapping pairs
+        std::vector<uint64_t> extRecs;
+        for (size_t o = 0; o + 0x1A <= alist.size();) {
+            uint32_t type; uint16_t rl; memcpy(&type, alist.data() + o, 4); memcpy(&rl, alist.data() + o + 4, 2);
+            if (rl < 0x1A || o + rl > alist.size()) break;
+            uint8_t nl = alist[o + 6]; uint64_t seg; memcpy(&seg, alist.data() + o + 0x10, 8);
+            Log(L"%s: attribute list %02x", v.info.root.c_str(), type);
+            if (type == 0x80 && nl == 0 && (seg & kRecMask) != 0 &&
+                std::find(extRecs.begin(), extRecs.end(), seg & kRecMask) == extRecs.end()) extRecs.push_back(seg & kRecMask);
+            o += rl;
+        }
+        for (uint64_t no : extRecs) {
+            Log(L"%s: process extended MFT file record %I64u", v.info.root.c_str(), no);
+            std::vector<uint8_t> rec;
+            if (!GetRecord(vol, recSize, no, rec, nullptr)) { Log(L"%s: 读取 $MFT 扩展记录 %I64u 失败（%lu）", v.info.root.c_str(), no, GetLastError()); continue; }
+            TryFixup(rec, sector);
+            uint64_t baseRef; memcpy(&baseRef, rec.data() + 0x20, 8);
+            if ((baseRef & kRecMask) != 0) { Log(L"%s: extended fragmented file record missing base file record with attribute list（记录 %I64u 基记录 %016I64x）", v.info.root.c_str(), no, baseRef); continue; }
+            ForEachAttr(rec.data(), static_cast<uint32_t>(rec.size()), [&](uint32_t type, const uint8_t* a, uint32_t alen) {
+                if (type == 0x80 && a[8] && a[9] == 0) {
+                    uint16_t ro; memcpy(&ro, a + 0x20, 2); uint64_t lowVcn; memcpy(&lowVcn, a + 0x10, 8);
+                    ParseRuns(a + ro, a + alen, runs, static_cast<int64_t>(lowVcn));
+                }
+            });
+        }
+        std::sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) { return a.vcn < b.vcn; });
+        runs.erase(std::unique(runs.begin(), runs.end(), [](const Run& a, const Run& b) { return a.vcn == b.vcn; }), runs.end());
     }
     int64_t covered = 0; for (auto& r : runs) covered += r.len;
     if (runs.empty() || static_cast<uint64_t>(covered) * cluster < total * recSize) {
-        err = hasAttrList ? L"$MFT 碎片过多（运行列表在属性列表扩展记录中），暂不支持" : L"$MFT 运行列表无效";
+        err = hasAttrList ? L"$MFT 运行列表不完整（属性列表扩展记录缺失）" : L"$MFT 运行列表无效";
         CloseHandle(vol); return false;
     }
 
@@ -291,11 +301,13 @@ bool MftIndexer::Build(VolumeData& v, bool enableUsn, std::atomic<bool>& stop, s
                 if (baseNo >= total) continue;
                 Rec& R = recs[baseNo];
                 if (!baseRef) { R.inUse = 1; R.seq = seq; R.dir = (flags & 2) ? 1 : 0; }
+                else R.ext = 1;
                 uint16_t ao; memcpy(&ao, r + 0x14, 2);
                 for (uint32_t a = ao; a + 16 <= recSize;) {
                     uint32_t type, alen; memcpy(&type, r + a, 4); if (type == 0xFFFFFFFF) break;
                     memcpy(&alen, r + a + 4, 4); if (alen < 16 || a + alen > recSize) break;
                     uint8_t nonres = r[a + 8], anl = r[a + 9];
+                    if (type == 0x20 && !baseRef) R.hasAL = 1;
                     if (!nonres) {
                         uint32_t vl; uint16_t vo; memcpy(&vl, r + a + 0x10, 4); memcpy(&vo, r + a + 0x14, 2);
                         const uint8_t* c = r + a + vo;
@@ -303,7 +315,8 @@ bool MftIndexer::Build(VolumeData& v, bool enableUsn, std::atomic<bool>& stop, s
                             if (type == 0x10 && vl >= 16) memcpy(&R.mtime, c + 8, 8);
                             else if (type == 0x30 && vl >= 0x42) {
                                 uint8_t nl = c[0x40], ns = c[0x41];
-                                uint8_t rank = (ns == 1 || ns == 3) ? 3 : (ns == 0 ? 2 : 1);   // Win32 > POSIX > DOS
+                                // 一个 FRN 一个对象：保留 Win32(1) 或 Win32+DOS(3)；POSIX(0) 仅在没有 Win32 名时；丢弃 DOS(2)
+                                uint8_t rank = (ns == 1 || ns == 3) ? 3 : (ns == 0 ? 2 : 0);
                                 if (rank > R.nameRank && 0x42u + nl * 2u <= vl) {
                                     memcpy(&R.parent, c, 8);
                                     R.nameOff = static_cast<uint32_t>(pool.size()); R.nameLen = nl; R.nameRank = rank;
@@ -344,6 +357,14 @@ bool MftIndexer::Build(VolumeData& v, bool enableUsn, std::atomic<bool>& stop, s
         v.frn.push_back(fullFrn(no)); parentRef.push_back(R.parent);
         idxOf[no] = i;
     }
+    size_t badExt = 0;
+    for (uint64_t no = 12; no < total; ++no) {
+        const Rec& R = recs[no];
+        if (R.ext && (!R.inUse || !R.hasAL)) {
+            if (badExt++ < 10) Log(L"%s: extended fragmented file record missing base file record with attribute list（基记录 %016I64x）", v.info.root.c_str(), fullFrn(no));
+        }
+    }
+    if (badExt) Log(L"%s: %zu 个扩展记录缺少带属性列表的基记录", v.info.root.c_str(), badExt);
     size_t orphans = 0;
     for (uint32_t i = 1; i < v.entries.size(); ++i) {
         uint64_t p = parentRef[i], pn = p & kRecMask;

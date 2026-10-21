@@ -1,4 +1,5 @@
 #pragma once
+#include "Index.h"
 #include <string>
 #include <vector>
 
@@ -21,10 +22,11 @@ struct Settings {
     // 外观
     ThemeMode theme = ThemeMode::System;
     bool compressDb = false;   // 数据库是否 XPRESS_HUFF 压缩
-    bool ntfsVolumeMonitors = true;       // ntfs_volume_monitors：持续读 USN
-    bool ntfsLoadRecentChanges = false;   // ntfs_volume_load_recent_changes（预留：最近更改列表）
-    bool ntfsEnableUsnJournal = true;     // ntfs_enable_usn_journal：Journal 未启用时创建（目前全卷共用）
     bool fastAsciiSearch = true;          // fast_ascii_search
+    int monitorUpdateDelay = 1000;        // monitor_update_delay（毫秒）：USN 批量合并间隔
+    // 每卷设置：ini 中的并行数组 ntfs_volume_paths / guids / includes / monitors / load_recent_changes /
+    // include_onlys / enable_usn_journals（逗号分隔；含逗号或引号的项用双引号）
+    std::vector<VolumeConfig> ntfsVolumes;
     // 索引：空 = 所有固定磁盘
     std::vector<std::wstring> indexRoots;
     std::vector<std::wstring> excludeFolders = {L"C:\\Windows\\WinSxS", L"C:\\$Recycle.Bin", L"C:\\System Volume Information"};
@@ -32,8 +34,12 @@ struct Settings {
     static constexpr int CW_USEDEFAULT_SENTINEL = -32768;
 
     std::wstring IniPath() const;
-    void Load();
-    void Save() const;
+    void Load() { LoadFrom(IniPath()); }
+    void Save() const { SaveTo(IniPath()); }
+    void LoadFrom(const std::wstring& ini, bool detect = true);
+    void SaveTo(const std::wstring& ini) const;
+    static std::vector<std::wstring> SplitArray(const std::wstring& s);
+    static std::wstring JoinArray(const std::vector<std::wstring>& v);
 };
 
 Settings& GetSettings();

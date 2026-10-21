@@ -17,8 +17,9 @@ std::wstring Settings::IniPath() const {
 }
 
 static std::wstring ReadStr(const std::wstring& ini, const wchar_t* sec, const wchar_t* key, const std::wstring& def) {
-    wchar_t buf[4096];
-    GetPrivateProfileStringW(sec, key, def.c_str(), buf, 4096, ini.c_str());
+    std::wstring buf(32768, L'\0');
+    DWORD n = GetPrivateProfileStringW(sec, key, def.c_str(), buf.data(), 32768, ini.c_str());
+    buf.resize(n);
     return buf;
 }
 static int ReadInt(const std::wstring& ini, const wchar_t* sec, const wchar_t* key, int def) {
@@ -39,8 +40,60 @@ static std::wstring Join(const std::vector<std::wstring>& v) {
     std::wstring r; for (auto& s : v) { if (!r.empty()) r += L';'; r += s; } return r;
 }
 
-void Settings::Load() {
-    const auto ini = IniPath();
+std::vector<std::wstring> Settings::SplitArray(const std::wstring& s) {
+    std::vector<std::wstring> r;
+    if (s.empty()) return r;
+    size_t i = 0;
+    for (;;) {
+        std::wstring item;
+        if (i < s.size() && s[i] == L'"') {
+            ++i;
+            while (i < s.size()) {
+                if (s[i] == L'"') { if (i + 1 < s.size() && s[i + 1] == L'"') { item += L'"'; i += 2; continue; } ++i; break; }
+                item += s[i++];
+            }
+            while (i < s.size() && s[i] != L',') ++i;
+        } else {
+            while (i < s.size() && s[i] != L',') item += s[i++];
+        }
+        r.push_back(std::move(item));
+        if (i >= s.size()) break;
+        ++i;   // ','
+    }
+    return r;
+}
+
+std::wstring Settings::JoinArray(const std::vector<std::wstring>& v) {
+    std::wstring r;
+    for (size_t k = 0; k < v.size(); ++k) {
+        if (k) r += L',';
+        if (v[k].find_first_of(L",\"") != std::wstring::npos) {
+            r += L'"';
+            for (wchar_t c : v[k]) { if (c == L'"') r += L'"'; r += c; }
+            r += L'"';
+        } else r += v[k];
+    }
+    return r;
+}
+
+static std::vector<VolumeConfig> DetectNtfsVolumes() {
+    std::vector<VolumeConfig> r;
+    DWORD mask = GetLogicalDrives();
+    for (int d = 0; d < 26; ++d) {
+        if (!(mask & (1u << d))) continue;
+        wchar_t root[] = {static_cast<wchar_t>(L'A' + d), L':', L'\\', 0};
+        if (GetDriveTypeW(root) != DRIVE_FIXED) continue;
+        wchar_t fs[32] = {};
+        if (!GetVolumeInformationW(root, nullptr, 0, nullptr, nullptr, nullptr, fs, 32) || wcscmp(fs, L"NTFS")) continue;
+        VolumeConfig v; v.path.assign(root, 2);
+        wchar_t g[64] = {};
+        if (GetVolumeNameForVolumeMountPointW(root, g, 64)) v.guid = g;
+        r.push_back(std::move(v));
+    }
+    return r;
+}
+
+void Settings::LoadFrom(const std::wstring& ini, bool detect) {
     // GetPrivateProfileInt 不支持负数，窗口坐标按字符串读
     x = _wtoi(ReadStr(ini, L"window", L"x", std::to_wstring(CW_USEDEFAULT_SENTINEL)).c_str());
     y = _wtoi(ReadStr(ini, L"window", L"y", L"0").c_str());
@@ -58,17 +111,40 @@ void Settings::Load() {
     doubleCtrl = ReadInt(ini, L"hotkey", L"toggle_window_double_ctrl", 1) != 0;
     theme = static_cast<ThemeMode>(ReadInt(ini, L"ui", L"theme", 0));
     compressDb = ReadInt(ini, L"index", L"compress_db", 0) != 0;
-    ntfsVolumeMonitors = ReadInt(ini, L"index", L"ntfs_volume_monitors", 1) != 0;
-    ntfsLoadRecentChanges = ReadInt(ini, L"index", L"ntfs_volume_load_recent_changes", 0) != 0;
-    ntfsEnableUsnJournal = ReadInt(ini, L"index", L"ntfs_enable_usn_journal", 1) != 0;
     fastAsciiSearch = ReadInt(ini, L"search", L"fast_ascii_search", 1) != 0;
+    monitorUpdateDelay = ReadInt(ini, L"index", L"monitor_update_delay", 1000);
+    {
+        auto paths = SplitArray(ReadStr(ini, L"index", L"ntfs_volume_paths", L""));
+        auto guids = SplitArray(ReadStr(ini, L"index", L"ntfs_volume_guids", L""));
+        auto incs = SplitArray(ReadStr(ini, L"index", L"ntfs_volume_includes", L""));
+        auto mons = SplitArray(ReadStr(ini, L"index", L"ntfs_volume_monitors", L""));
+        auto recs = SplitArray(ReadStr(ini, L"index", L"ntfs_volume_load_recent_changes", L""));
+        auto only = SplitArray(ReadStr(ini, L"index", L"ntfs_volume_include_onlys", L""));
+        auto jrn = SplitArray(ReadStr(ini, L"index", L"ntfs_volume_enable_usn_journals", L""));
+        auto flag = [](const std::vector<std::wstring>& a, size_t i, bool def) { return i < a.size() && !a[i].empty() ? _wtoi(a[i].c_str()) != 0 : def; };
+        ntfsVolumes.clear();
+        for (size_t i = 0; i < paths.size(); ++i) {
+            if (paths[i].empty()) continue;
+            VolumeConfig v; v.path = paths[i];
+            v.guid = i < guids.size() ? guids[i] : L"";
+            v.include = flag(incs, i, true); v.monitor = flag(mons, i, true);
+            v.loadRecentChanges = flag(recs, i, false); v.enableUsnJournal = flag(jrn, i, true);
+            if (i < only.size()) v.includeOnly = Split(only[i]);
+            ntfsVolumes.push_back(std::move(v));
+        }
+        if (detect)
+            for (auto& d : DetectNtfsVolumes()) {
+                bool known = false;
+                for (auto& v : ntfsVolumes) if (_wcsicmp(v.path.c_str(), d.path.c_str()) == 0) { known = true; if (v.guid.empty()) v.guid = d.guid; }
+                if (!known) ntfsVolumes.push_back(std::move(d));
+            }
+    }
     indexRoots = Split(ReadStr(ini, L"index", L"roots", L""));
     auto ex = ReadStr(ini, L"index", L"exclude_folders", L"\x01");
     if (ex != L"\x01") excludeFolders = Split(ex);
 }
 
-void Settings::Save() const {
-    const auto ini = IniPath();
+void Settings::SaveTo(const std::wstring& ini) const {
     WriteInt(ini, L"window", L"x", x); WriteInt(ini, L"window", L"y", y);
     WriteInt(ini, L"window", L"w", w); WriteInt(ini, L"window", L"h", h);
     WriteInt(ini, L"window", L"maximized", maximized);
@@ -81,10 +157,26 @@ void Settings::Save() const {
     WriteInt(ini, L"hotkey", L"toggle_window_double_ctrl", doubleCtrl);
     WriteInt(ini, L"ui", L"theme", static_cast<int>(theme));
     WriteInt(ini, L"index", L"compress_db", compressDb);
-    WriteInt(ini, L"index", L"ntfs_volume_monitors", ntfsVolumeMonitors);
-    WriteInt(ini, L"index", L"ntfs_volume_load_recent_changes", ntfsLoadRecentChanges);
-    WriteInt(ini, L"index", L"ntfs_enable_usn_journal", ntfsEnableUsnJournal);
     WriteInt(ini, L"search", L"fast_ascii_search", fastAsciiSearch);
+    WriteInt(ini, L"index", L"monitor_update_delay", monitorUpdateDelay);
+    {
+        std::vector<std::wstring> paths, guids, incs, mons, recs, only, jrn;
+        for (auto& v : ntfsVolumes) {
+            paths.push_back(v.path); guids.push_back(v.guid);
+            incs.push_back(v.include ? L"1" : L"0"); mons.push_back(v.monitor ? L"1" : L"0");
+            recs.push_back(v.loadRecentChanges ? L"1" : L"0"); jrn.push_back(v.enableUsnJournal ? L"1" : L"0");
+            only.push_back(Join(v.includeOnly));
+        }
+        // 整个值包一层引号：GetPrivateProfileString 会去掉最外层的一对引号，保护内部的引号
+        auto q = [](const std::wstring& s) { return L"\"" + s + L"\""; };
+        WriteStr(ini, L"index", L"ntfs_volume_paths", q(JoinArray(paths)));
+        WriteStr(ini, L"index", L"ntfs_volume_guids", q(JoinArray(guids)));
+        WriteStr(ini, L"index", L"ntfs_volume_includes", q(JoinArray(incs)));
+        WriteStr(ini, L"index", L"ntfs_volume_monitors", q(JoinArray(mons)));
+        WriteStr(ini, L"index", L"ntfs_volume_load_recent_changes", q(JoinArray(recs)));
+        WriteStr(ini, L"index", L"ntfs_volume_include_onlys", q(JoinArray(only)));
+        WriteStr(ini, L"index", L"ntfs_volume_enable_usn_journals", q(JoinArray(jrn)));
+    }
     WriteStr(ini, L"index", L"roots", Join(indexRoots));
     WriteStr(ini, L"index", L"exclude_folders", Join(excludeFolders));
 }

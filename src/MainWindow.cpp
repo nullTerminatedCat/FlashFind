@@ -204,13 +204,18 @@ void MainWindow::Paint() {
 void MainWindow::StartIndex(bool force) {
     auto& s = GetSettings();
     Indexer::Options o;
-    o.roots = s.indexRoots.empty() ? Indexer::DefaultRoots() : s.indexRoots;
+    o.roots.clear();
+    for (auto& r : s.indexRoots.empty() ? Indexer::DefaultRoots() : s.indexRoots) {
+        bool skip = false;
+        for (auto& v : s.ntfsVolumes) if (_wcsicmp(v.path.c_str(), r.c_str()) == 0 && !v.include) skip = true;
+        if (!skip) o.roots.push_back(r);
+    }
+    o.volumes = s.ntfsVolumes;
+    o.monitorDelayMs = s.monitorUpdateDelay;
     o.excludes = s.excludeFolders;
     o.dbPath = Indexer::DefaultDbPath();
     o.compress = s.compressDb;
     o.forceRebuild = force;
-    o.monitor = s.ntfsVolumeMonitors;
-    o.enableUsnJournal = s.ntfsEnableUsnJournal;
     g_fastAscii = s.fastAsciiSearch;
     noteShown_ = false;
     // TODO(服务): 需要特权的 MFT 读取将来交给服务进程；目前当前进程已提升时直接读取
