@@ -1,0 +1,142 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>Everything 克隆 — Fluent v2</title>
+<style>
+:root{--bg:#f3f3f3;--mica:linear-gradient(135deg,#eef2f8,#f6f3f1 60%,#f1f4ef);--card:#fbfbfb;--layer:#ffffff;--stroke:#e5e5e5;--stroke2:#d1d1d1;--text:#1b1b1b;--text2:#5d5d5d;--text3:#8a8a8a;--accent:#0067c0;--accentText:#fff;--hover:rgba(0,0,0,.037);--sel:rgba(0,103,192,.10);--selbar:#0067c0;--alt:rgba(0,0,0,.018);--hl:#fff1b8;--hlText:#1b1b1b;--shadow:0 8px 32px rgba(0,0,0,.18),0 2px 8px rgba(0,0,0,.08);--err:#c42b1c;--desk:linear-gradient(135deg,#7aa7d8,#b9c9e8 50%,#e4d2c4)}
+.dark{--bg:#202020;--mica:linear-gradient(135deg,#1f2229,#202020 60%,#23211f);--card:#2b2b2b;--layer:#272727;--stroke:#3a3a3a;--stroke2:#454545;--text:#f0f0f0;--text2:#c5c5c5;--text3:#8f8f8f;--accent:#4cc2ff;--accentText:#000;--hover:rgba(255,255,255,.055);--sel:rgba(76,194,255,.16);--selbar:#4cc2ff;--alt:rgba(255,255,255,.022);--hl:#5c4a00;--hlText:#ffe58a;--shadow:0 8px 32px rgba(0,0,0,.55),0 2px 8px rgba(0,0,0,.35);--err:#ff99a4;--desk:linear-gradient(135deg,#0f1b2d,#1d2a44 50%,#2d2330)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--desk);font:13px "Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI",sans-serif;color:var(--text);padding:28px;display:flex;flex-direction:column;gap:22px;align-items:flex-start}
+h2{margin:0;font:600 15px "Segoe UI Variable Display","Segoe UI","Microsoft YaHei UI";color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.4)}
+.bar{display:flex;gap:10px;align-items:center}
+.tog{background:var(--layer);color:var(--text);border:1px solid var(--stroke2);border-radius:6px;padding:5px 12px;font:inherit;cursor:pointer}
+.row{display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap}
+.win{background:var(--mica);border:1px solid var(--stroke2);border-radius:8px;box-shadow:var(--shadow);overflow:hidden;display:flex;flex-direction:column;position:relative}
+svg{width:16px;height:16px;flex:none;fill:none;stroke:currentColor;stroke-width:1.3;stroke-linecap:round;stroke-linejoin:round}
+.tb{height:40px;display:flex;align-items:center;padding-left:12px;gap:10px}
+.tb .t{flex:1;font-size:12px;color:var(--text2)}
+.cap{width:46px;height:40px;display:grid;place-items:center;color:var(--text2)}.cap:hover{background:var(--hover)}.cap.x:hover{background:#c42b1c;color:#fff}
+.logo{width:18px;height:18px;border-radius:5px;background:linear-gradient(135deg,#ffb259,#e8590c);display:grid;place-items:center;color:#fff}.logo svg{width:12px;height:12px;stroke-width:2}
+.menu{display:flex;gap:2px;padding:0 6px 4px}.menu span{padding:4px 10px;border-radius:4px}.menu span:hover{background:var(--hover)}
+.searchrow{display:flex;gap:8px;padding:2px 12px 10px}
+.search{flex:1;display:flex;align-items:center;gap:8px;height:34px;padding:0 10px;background:var(--layer);border:1px solid var(--stroke);border-bottom:2px solid var(--accent);border-radius:6px;color:var(--text2)}
+.search input{flex:1;border:0;outline:0;background:transparent;font:inherit;color:var(--text)}
+.chip{font-size:11px;padding:2px 7px;border-radius:10px;border:1px solid var(--stroke2);color:var(--text2)}.chip.on{background:var(--accent);border-color:var(--accent);color:var(--accentText)}
+.combo{display:flex;align-items:center;gap:8px;height:34px;padding:0 10px;width:160px;background:var(--layer);border:1px solid var(--stroke);border-radius:6px}.combo span{flex:1}
+.list{margin:0 8px;background:var(--card);border:1px solid var(--stroke);border-radius:8px 8px 0 0;flex:1;overflow:hidden}
+.grid{display:grid;grid-template-columns:270px 1fr 90px 140px}
+.hdr{color:var(--text2);font-size:12px;border-bottom:1px solid var(--stroke)}.hdr div{padding:8px 12px;display:flex;gap:4px;align-items:center}.hdr div+div{border-left:1px solid var(--stroke)}
+.r{justify-content:flex-end;text-align:right}
+.item{margin:1px 4px;border-radius:4px;position:relative;height:30px;align-items:center}.item>div{padding:0 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.item:nth-child(odd){background:var(--alt)}.item:hover{background:var(--hover)}
+.item.sel{background:var(--sel)}.item.sel:before{content:"";position:absolute;left:0;top:8px;bottom:8px;width:3px;border-radius:2px;background:var(--selbar)}
+.fn{overflow:hidden;text-overflow:ellipsis}.nm{display:flex;gap:8px;align-items:center}.p,.d,.s{color:var(--text2)}.s{text-align:right}
+mark{background:var(--hl);color:var(--hlText);border-radius:3px;padding:0 1px;font-weight:600}
+.fi{width:18px;height:18px}.fold{color:#e0a526}.doc{color:#2b7cd3}.xls{color:#1f8f4e}.pdf{color:#d13438}.exe{color:#7160e8}.txt{color:var(--text2)}
+.status{height:32px;display:flex;align-items:center;gap:16px;padding:0 14px;font-size:12px;color:var(--text2)}
+.status .dot{width:7px;height:7px;border-radius:50%;background:#2fb344;display:inline-block;margin-right:6px}.status .sp{flex:1}
+.status .pill{background:var(--hover);border-radius:10px;padding:2px 9px}
+.ctx{position:absolute;left:300px;top:200px;width:250px;background:var(--layer);border:1px solid var(--stroke2);border-radius:8px;box-shadow:var(--shadow);padding:4px}
+.ctx .i{display:flex;align-items:center;gap:10px;height:30px;padding:0 10px;border-radius:4px}.ctx .i:hover,.ctx .i.h{background:var(--hover)}.ctx .i span{flex:1}.ctx kbd{font-family:inherit;font-size:11px;color:var(--text3)}
+.ctx hr{border:0;border-top:1px solid var(--stroke);margin:4px -4px}
+.dlg{width:760px}.dlg .body{display:flex;height:660px}
+.nav{width:210px;padding:6px 8px;overflow:auto}.nav .g{font-size:11px;color:var(--text3);padding:10px 10px 4px}
+.nav .n{display:flex;gap:10px;align-items:center;height:32px;padding:0 10px;border-radius:4px;position:relative;color:var(--text)}.nav .n:hover{background:var(--hover)}
+.nav .n.s{background:var(--hover)}.nav .n.s:before{content:"";position:absolute;left:0;top:9px;bottom:9px;width:3px;border-radius:2px;background:var(--accent)}
+.page{flex:1;padding:4px 20px 12px 8px;overflow:auto}.page h1{font:600 22px "Segoe UI Variable Display","Segoe UI","Microsoft YaHei UI";margin:4px 0 14px}
+.card{background:var(--card);border:1px solid var(--stroke);border-radius:6px;margin-bottom:4px;padding:12px 14px;display:flex;align-items:center;gap:12px}
+.card .tx{flex:1}.card .sub{font-size:12px;color:var(--text2);margin-top:2px}
+.sec{font-weight:600;margin:14px 0 6px}
+.hk{display:flex;align-items:center;gap:6px;min-width:200px;height:32px;padding:0 8px;background:var(--layer);border:1px solid var(--stroke);border-radius:5px}.hk.f{border-bottom:2px solid var(--accent)}
+.hk kbd{font-family:inherit;font-size:12px;padding:1px 7px;border:1px solid var(--stroke2);border-bottom-width:2px;border-radius:4px;background:var(--card)}
+.btn{height:32px;padding:0 14px;border-radius:5px;border:1px solid var(--stroke2);background:var(--layer);color:var(--text);font:inherit;display:inline-flex;align-items:center}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:var(--accentText)}
+.sw{width:40px;height:20px;border-radius:10px;border:1px solid var(--text2);position:relative;flex:none}.sw:after{content:"";position:absolute;top:4px;left:4px;width:10px;height:10px;border-radius:50%;background:var(--text2)}
+.sw.on{background:var(--accent);border-color:var(--accent)}.sw.on:after{left:24px;background:var(--accentText)}
+.err{color:var(--err);font-size:12px;display:flex;gap:4px;align-items:center;margin-top:4px}
+.tbl{width:100%;border-collapse:collapse;font-size:12px}.tbl td,.tbl th{padding:6px 8px;text-align:left}.tbl th{color:var(--text2);font-weight:400;border-bottom:1px solid var(--stroke)}.tbl tr.s td{background:var(--sel)}
+.foot{display:flex;gap:8px;padding:14px 20px;border-top:1px solid var(--stroke);background:var(--layer)}.foot .sp{flex:1}
+select{font:inherit;color:var(--text);background:var(--layer);border:1px solid var(--stroke);border-radius:5px;height:30px;padding:0 8px}
+</style></head><body>
+<svg style="display:none"><defs>
+<symbol id="i-search" viewBox="0 0 16 16"><circle cx="6.5" cy="6.5" r="4.5"/><path d="M10 10l4.5 4.5"/></symbol>
+<symbol id="i-folder" viewBox="0 0 16 16"><path d="M1.5 4.5a1.5 1.5 0 011.5-1.5h3l1.5 1.5h5.5a1.5 1.5 0 011.5 1.5v6a1.5 1.5 0 01-1.5 1.5H3a1.5 1.5 0 01-1.5-1.5z" fill="currentColor" fill-opacity=".25"/></symbol>
+<symbol id="i-doc" viewBox="0 0 16 16"><path d="M4 1.5h5l3.5 3.5v9a1 1 0 01-1 1h-7.5a1 1 0 01-1-1v-11.5a1 1 0 011-1z" fill="currentColor" fill-opacity=".15"/><path d="M9 1.5V5h3.5M5.5 8.5h5M5.5 11h5"/></symbol>
+<symbol id="i-app" viewBox="0 0 16 16"><rect x="2" y="2" width="12" height="12" rx="2.5" fill="currentColor" fill-opacity=".2"/><path d="M2 5.5h12"/></symbol>
+<symbol id="i-filter" viewBox="0 0 16 16"><path d="M2 3h12l-4.5 5.5V13l-3 1.5v-6z"/></symbol>
+<symbol id="i-chev" viewBox="0 0 16 16"><path d="M4 6l4 4 4-4"/></symbol>
+<symbol id="i-up" viewBox="0 0 16 16"><path d="M4 10l4-4 4 4"/></symbol>
+<symbol id="i-open" viewBox="0 0 16 16"><path d="M9 2.5h4.5V7M13.5 2.5L7 9M12 9.5v3a1 1 0 01-1 1H3.5a1 1 0 01-1-1V5a1 1 0 011-1h3"/></symbol>
+<symbol id="i-copy" viewBox="0 0 16 16"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3a1 1 0 00-1-1H3a1 1 0 00-1 1v7a1 1 0 001 1h2"/></symbol>
+<symbol id="i-cut" viewBox="0 0 16 16"><circle cx="4" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><path d="M5.5 10.5L12 2M10.5 10.5L4 2"/></symbol>
+<symbol id="i-del" viewBox="0 0 16 16"><path d="M2.5 4h11M6 4V2.5h4V4M4 4l.7 9.5a1 1 0 001 .9h4.6a1 1 0 001-.9L12 4"/></symbol>
+<symbol id="i-ren" viewBox="0 0 16 16"><path d="M10.5 2.5l3 3L6 13H3v-3z"/></symbol>
+<symbol id="i-info" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.5"/><path d="M8 7v4.5M8 4.8v.2"/></symbol>
+<symbol id="i-link" viewBox="0 0 16 16"><path d="M7 9a3 3 0 004.2 0l2-2a3 3 0 00-4.2-4.2L8 3.8M9 7a3 3 0 00-4.2 0l-2 2A3 3 0 007 13.2l1-1"/></symbol>
+<symbol id="i-path" viewBox="0 0 16 16"><path d="M2 13h12M4 13V6l4-3 4 3v7"/></symbol>
+<symbol id="i-gear" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4"/></symbol>
+<symbol id="i-kbd" viewBox="0 0 16 16"><rect x="1.5" y="4" width="13" height="8.5" rx="1.5"/><path d="M4 7h1M7 7h1M10 7h1M5 10h6"/></symbol>
+<symbol id="i-db" viewBox="0 0 16 16"><ellipse cx="8" cy="4" rx="5.5" ry="2"/><path d="M2.5 4v8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2V4M2.5 8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2"/></symbol>
+<symbol id="i-eye" viewBox="0 0 16 16"><path d="M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/></symbol>
+<symbol id="i-paint" viewBox="0 0 16 16"><path d="M8 1.5a6.5 6.5 0 100 13c1 0 1.3-.8.8-1.5-.6-.9 0-2 1.1-2h1.6a3 3 0 003-3A6.5 6.5 0 008 1.5z"/><circle cx="5" cy="7" r=".8"/><circle cx="8" cy="4.5" r=".8"/><circle cx="11" cy="6.5" r=".8"/></symbol>
+<symbol id="i-hist" viewBox="0 0 16 16"><path d="M2 8a6 6 0 101.8-4.3M2 2v3h3M8 5v3l2 1.5"/></symbol>
+<symbol id="i-globe" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.5"/><path d="M1.5 8h13M8 1.5c2 2 2 11 0 13M8 1.5c-2 2-2 11 0 13"/></symbol>
+<symbol id="i-warn" viewBox="0 0 16 16"><path d="M8 2l6.5 11.5h-13zM8 6.5v3.5M8 11.8v.2"/></symbol>
+<symbol id="i-min" viewBox="0 0 16 16"><path d="M3 8h10"/></symbol><symbol id="i-max" viewBox="0 0 16 16"><rect x="3" y="3" width="10" height="10" rx="2"/></symbol><symbol id="i-x" viewBox="0 0 16 16"><path d="M3.5 3.5l9 9M12.5 3.5l-9 9"/></symbol>
+<symbol id="i-bolt" viewBox="0 0 16 16"><path d="M9 1.5L3 9h4.5L7 14.5 13 7H8.5z"/></symbol>
+</defs></svg>
+<div class="bar"><h2>Everything 克隆 — Fluent 视觉稿 v2</h2><button class="tog" onclick="document.documentElement.classList.toggle('dark')">切换 浅色 / 深色</button></div>
+<h2>主窗口</h2>
+<div class="win" style="width:960px;height:600px">
+ <div class="tb"><div class="logo"><svg><use href="#i-search"/></svg></div><div class="t">report — Everything</div><div class="cap"><svg><use href="#i-min"/></svg></div><div class="cap"><svg><use href="#i-max"/></svg></div><div class="cap x"><svg><use href="#i-x"/></svg></div></div>
+ <div class="menu"><span>文件</span><span>编辑</span><span>视图</span><span>搜索</span><span>书签</span><span>工具</span><span>帮助</span></div>
+ <div class="searchrow"><div class="search"><svg><use href="#i-search"/></svg><input value="report"><span class="chip">Aa</span><span class="chip">整词</span><span class="chip on">路径</span><span class="chip">正则</span></div>
+  <div class="combo"><svg><use href="#i-filter"/></svg><span>全部</span><svg><use href="#i-chev"/></svg></div></div>
+ <div class="list">
+  <div class="grid hdr"><div>名称 <svg style="width:12px;height:12px"><use href="#i-up"/></svg></div><div>路径</div><div class="r">大小</div><div>修改时间</div></div>
+  <div id="rows"></div>
+ </div>
+ <div class="status"><span><i class="dot"></i>索引已就绪</span><span class="pill">2,317 个对象</span><span>已选 1 个 · 1.25 MB</span><span class="sp"></span><span>排序：名称 ↑</span><span>Ctrl+Alt+Space 显示/隐藏</span></div>
+ <div class="ctx">
+  <div class="i h"><svg><use href="#i-open"/></svg><span><b>打开</b></span><kbd>Enter</kbd></div>
+  <div class="i"><svg><use href="#i-path"/></svg><span>打开路径</span><kbd>Ctrl+Enter</kbd></div>
+  <div class="i"><svg><use href="#i-folder"/></svg><span>在资源管理器中定位</span></div><hr>
+  <div class="i"><svg><use href="#i-cut"/></svg><span>剪切</span><kbd>Ctrl+X</kbd></div>
+  <div class="i"><svg><use href="#i-copy"/></svg><span>复制</span><kbd>Ctrl+C</kbd></div>
+  <div class="i"><svg><use href="#i-copy"/></svg><span>复制完整路径</span><kbd>Ctrl+Shift+C</kbd></div><hr>
+  <div class="i"><svg><use href="#i-link"/></svg><span>创建快捷方式</span></div>
+  <div class="i"><svg><use href="#i-ren"/></svg><span>重命名</span><kbd>F2</kbd></div>
+  <div class="i"><svg><use href="#i-del"/></svg><span>删除</span><kbd>Del</kbd></div><hr>
+  <div class="i"><svg><use href="#i-chev" style="transform:rotate(-90deg)"/></svg><span>更多选项</span><kbd>Shift+F10</kbd></div>
+  <div class="i"><svg><use href="#i-info"/></svg><span>属性</span><kbd>Alt+Enter</kbd></div>
+ </div>
+</div>
+<h2>选项 — 键盘页（全局热键）</h2>
+<div class="win dlg">
+ <div class="tb"><div class="logo"><svg><use href="#i-gear"/></svg></div><div class="t">选项</div><div class="cap x"><svg><use href="#i-x"/></svg></div></div>
+ <div class="body">
+  <div class="nav">
+   <div class="g">常规</div>
+   <div class="n"><svg><use href="#i-gear"/></svg>常规</div><div class="n"><svg><use href="#i-search"/></svg>搜索</div><div class="n"><svg><use href="#i-eye"/></svg>结果与视图</div><div class="n"><svg><use href="#i-paint"/></svg>外观</div><div class="n s"><svg><use href="#i-kbd"/></svg>键盘</div><div class="n"><svg><use href="#i-hist"/></svg>历史</div>
+   <div class="g">索引</div>
+   <div class="n"><svg><use href="#i-db"/></svg>索引与 NTFS</div><div class="n"><svg><use href="#i-folder"/></svg>文件夹</div><div class="n"><svg><use href="#i-doc"/></svg>文件列表 / 排除</div>
+   <div class="g">网络</div>
+   <div class="n"><svg><use href="#i-globe"/></svg>HTTP / ETP 服务器</div>
+  </div>
+  <div class="page"><h1>键盘</h1>
+   <div class="sec">全局热键</div>
+   <div class="card"><svg><use href="#i-bolt"/></svg><div class="tx">显示 / 隐藏窗口<div class="sub">窗口在前台时隐藏到托盘，否则显示在鼠标所在显示器</div></div><div class="hk f"><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Space</kbd></div><button class="btn">清除</button></div>
+   <div class="card"><svg><use href="#i-kbd"/></svg><div class="tx">双击 Ctrl 显示 / 隐藏<div class="sub">两次按键间隔 ≤ 300 ms</div></div><div class="sw"></div></div>
+   <div class="card" style="align-items:flex-start"><svg style="margin-top:2px"><use href="#i-app"/></svg><div class="tx">新建窗口<div class="err"><svg style="width:14px;height:14px"><use href="#i-warn"/></svg>该热键已被其他程序占用，已保留原设置</div></div><div class="hk" style="border-color:var(--err)"><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>N</kbd></div><button class="btn">清除</button></div>
+   <div class="sec">窗口</div>
+   <div class="card"><div class="tx">Esc 隐藏到托盘<div class="sub">搜索框有内容时先清空</div></div><div class="sw on"></div></div>
+   <div class="card"><div class="tx">Ctrl + 滚轮</div><select><option>缩放字体</option></select></div>
+   <div class="sec">命令快捷键</div>
+   <div class="card" style="display:block;padding:4px 6px"><table class="tbl"><tr><th>命令</th><th style="width:150px">快捷键</th></tr><tr><td>新建搜索窗口</td><td>Ctrl+N</td></tr><tr class="s"><td>选项</td><td>Ctrl+P</td></tr><tr><td>区分大小写</td><td>Ctrl+I</td></tr></table></div>
+  </div>
+ </div>
+ <div class="foot"><button class="btn">恢复默认</button><span class="sp"></span><button class="btn pri">确定</button><button class="btn">取消</button><button class="btn">应用</button></div>
+</div>
+<script>
+if(location.hash=='#dark')document.documentElement.classList.add('dark');
+const R=[["fold","folder","<mark>report</mark>s","C:\\Users\\lincx\\Documents","","2026/10/18 14:02"],["doc","doc","2026年度<mark>report</mark>.docx","D:\\工作\\总结","1,284 KB","2026/10/20 09:12",1],["txt","doc","bug_<mark>report</mark>.txt","F:\\work\\everything\\docs","4 KB","2026/10/21 13:05"],["exe","app","Crash<mark>Report</mark>er.exe","C:\\Program Files\\Mozilla Firefox","256 KB","2026/09/30 22:41"],["xls","doc","monthly_<mark>report</mark>.xlsx","D:\\工作\\财务\\2026","88 KB","2026/10/01 10:00"],["fold","folder","<mark>report</mark>_templates","E:\\Backup","","2025/12/11 08:30"],["pdf","doc","<mark>report</mark>.pdf","C:\\Users\\lincx\\Downloads","2,031 KB","2026/10/15 17:22"],["txt","doc","<mark>report</mark>.css","F:\\work\\site\\assets","12 KB","2026/08/02 11:11"],["txt","doc","test_<mark>report</mark>.html","F:\\work\\screenshot\\build","36 KB","2026/10/21 13:34"],["fold","folder","<mark>Report</mark>s","C:\\Windows\\System32\\LogFiles","","2026/10/21 08:00"],["txt","doc","WER<mark>Report</mark>.xml","C:\\ProgramData\\Microsoft\\Windows\\WER","7 KB","2026/10/19 03:14"],["txt","doc","weekly-<mark>report</mark>.md","F:\\notes","3 KB","2026/10/17 18:45"]];
+document.getElementById('rows').innerHTML=R.map(r=>`<div class="grid item${r[6]?' sel':''}"><div class="nm"><svg class="fi ${r[0]}"><use href="#i-${r[1]}"/></svg><span class="fn">${r[2]}</span></div><div class="p">${r[3]}</div><div class="s">${r[4]}</div><div class="d">${r[5]}</div></div>`).join('');
+</script>
+</body></html>

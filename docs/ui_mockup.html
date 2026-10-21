@@ -1,0 +1,94 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>Everything 克隆 UI 原型</title>
+<style>
+body{margin:0;background:#3a6ea5;font:12px "Segoe UI","Microsoft YaHei UI",sans-serif;padding:20px;display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start}
+.win{background:#fff;border:1px solid #6b7c93;box-shadow:0 8px 24px rgba(0,0,0,.4);display:flex;flex-direction:column}
+.title{height:30px;display:flex;align-items:center;padding-left:8px;background:#fff;border-bottom:1px solid #eee}
+.title .ic{width:16px;height:16px;background:radial-gradient(circle at 40% 40%,#ff9a3c,#d9480f);border-radius:50%;margin-right:8px}
+.title .t{flex:1}.title .b{width:46px;text-align:center;line-height:30px;font-size:14px}.title .b.x:hover{background:#e81123;color:#fff}
+.menu{display:flex;height:20px;align-items:center;background:#fff}.menu span{padding:2px 8px}.menu span:hover{background:#e5f3ff}
+.sbar{display:flex;gap:4px;padding:3px 4px}.sbar input{flex:1;border:1px solid #7a7a7a;padding:3px 4px;font:inherit}.sbar select{width:150px;font:inherit}
+table{border-collapse:collapse;width:100%;table-layout:fixed}
+th{font-weight:normal;text-align:left;border-right:1px solid #e5e5e5;border-bottom:1px solid #e5e5e5;padding:3px 6px;color:#333;background:#fff}
+th.r,td.r{text-align:right}td{padding:1px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;height:18px}
+tr:nth-child(even) td{background:#f7f7f7}tr.sel td{background:#cce8ff}b.hl{font-weight:700}
+.list{flex:1;overflow:hidden;border-top:1px solid #ddd}
+.f{display:inline-block;width:14px;height:12px;margin-right:5px;vertical-align:-2px;border-radius:2px}
+.fd{background:#f3c94f}.fl{background:#fff;border:1px solid #888;width:11px;height:13px}.fx{background:#4a90d9}
+.status{height:22px;border-top:1px solid #ddd;display:flex;align-items:center;background:#f0f0f0}.status div{padding:0 8px;border-right:1px solid #ccc}
+.ctx{position:absolute;left:250px;top:215px;background:#fff;border:1px solid #ccc;box-shadow:2px 2px 6px rgba(0,0,0,.3);padding:3px 0;width:210px}
+.ctx div{padding:3px 24px;display:flex;justify-content:space-between}.ctx div:hover{background:#e5f3ff}.ctx hr{border:0;border-top:1px solid #ddd;margin:3px 2px}
+.hk{border:1px solid #7a7a7a;padding:3px 6px;width:180px;display:inline-block;background:#fff}.hk.f{outline:2px solid #0078d7}.err{color:#c42b1c;margin-left:6px}
+.dlg .body{display:flex;height:430px}.tree{width:170px;border:1px solid #aaa;margin:8px;padding:4px;overflow:auto}
+.tree div{padding:1px 4px}.tree .s{background:#cce8ff}.tree .c{padding-left:18px}
+.page{flex:1;padding:8px 12px 8px 4px}.page h3{margin:4px 0 8px;font-size:12px}.page label{display:block;margin:4px 0}
+fieldset{border:1px solid #ccc;margin:8px 0;padding:6px 10px}.btns{display:flex;justify-content:flex-end;gap:6px;padding:8px;border-top:1px solid #eee}
+button{min-width:75px;font:inherit;padding:3px 8px}h2{color:#fff;width:100%;margin:0;font-size:16px}
+</style></head><body>
+<h2>主窗口</h2>
+<div class="win" style="width:900px;height:560px;position:relative">
+ <div class="title"><div class="ic"></div><div class="t">report - Everything</div><div class="b">—</div><div class="b">☐</div><div class="b x">✕</div></div>
+ <div class="menu"><span>文件(F)</span><span>编辑(E)</span><span>视图(V)</span><span>搜索(S)</span><span>书签(B)</span><span>工具(T)</span><span>帮助(H)</span></div>
+ <div class="sbar"><input value="report"><select><option>Everything</option><option>音频</option><option>压缩</option><option>文档</option><option>可执行</option><option>文件夹</option><option>图片</option><option>视频</option></select></div>
+ <div class="list"><table>
+ <colgroup><col style="width:240px"><col><col style="width:90px"><col style="width:140px"></colgroup>
+ <tr><th>名称 ▲</th><th>路径</th><th class="r">大小</th><th>修改时间</th></tr>
+ <tr><td><i class="f fd"></i><b class="hl">report</b>s</td><td>C:\Users\lincx\Documents</td><td class="r"></td><td>2026/10/18 14:02</td></tr>
+ <tr class="sel"><td><i class="f fl"></i>2026年度<b class="hl">report</b>.docx</td><td>D:\工作\总结</td><td class="r">1,284 KB</td><td>2026/10/20 09:12</td></tr>
+ <tr><td><i class="f fl"></i>bug_<b class="hl">report</b>.txt</td><td>F:\work\everything\docs</td><td class="r">4 KB</td><td>2026/10/21 13:05</td></tr>
+ <tr><td><i class="f fx"></i>Crash<b class="hl">Report</b>er.exe</td><td>C:\Program Files\Mozilla Firefox</td><td class="r">256 KB</td><td>2026/09/30 22:41</td></tr>
+ <tr><td><i class="f fl"></i>monthly_<b class="hl">report</b>.xlsx</td><td>D:\工作\财务\2026</td><td class="r">88 KB</td><td>2026/10/01 10:00</td></tr>
+ <tr><td><i class="f fd"></i><b class="hl">report</b>_templates</td><td>E:\Backup</td><td class="r"></td><td>2025/12/11 08:30</td></tr>
+ <tr><td><i class="f fl"></i><b class="hl">report</b>.pdf</td><td>C:\Users\lincx\Downloads</td><td class="r">2,031 KB</td><td>2026/10/15 17:22</td></tr>
+ <tr><td><i class="f fl"></i><b class="hl">report</b>.css</td><td>F:\work\site\assets</td><td class="r">12 KB</td><td>2026/08/02 11:11</td></tr>
+ <tr><td><i class="f fl"></i>test_<b class="hl">report</b>.html</td><td>F:\work\screenshot\build</td><td class="r">36 KB</td><td>2026/10/21 13:34</td></tr>
+ <tr><td><i class="f fd"></i><b class="hl">Report</b>s</td><td>C:\Windows\System32\LogFiles</td><td class="r"></td><td>2026/10/21 08:00</td></tr>
+ <tr><td><i class="f fl"></i>WER<b class="hl">Report</b>.xml</td><td>C:\ProgramData\Microsoft\Windows\WER</td><td class="r">7 KB</td><td>2026/10/19 03:14</td></tr>
+ <tr><td><i class="f fl"></i>weekly-<b class="hl">report</b>.md</td><td>F:\notes</td><td class="r">3 KB</td><td>2026/10/17 18:45</td></tr>
+ </table></div>
+ <div class="status"><div>2,317 个对象</div><div>已选 1 个，1.25 MB</div><div style="border:0;flex:1"></div></div>
+ <div class="ctx"><div><b>打开</b><span>Enter</span></div><div>打开路径<span>Ctrl+Enter</span></div><div>在资源管理器中定位</div><hr><div>发送到 <span>▸</span></div><div>用 7-Zip 压缩... <span>▸</span></div><hr><div>剪切<span>Ctrl+X</span></div><div>复制<span>Ctrl+C</span></div><div>复制到文件夹...</div><div>移动到文件夹...</div><hr><div>复制完整路径<span>Ctrl+Shift+C</span></div><div>复制名称</div><hr><div>创建快捷方式</div><div>删除<span>Del</span></div><div>重命名<span>F2</span></div><hr><div>属性<span>Alt+Enter</span></div></div>
+</div>
+<h2>选项对话框</h2>
+<div class="win dlg" style="width:680px">
+ <div class="title"><div class="t">选项</div><div class="b x">✕</div></div>
+ <div class="body">
+  <div class="tree"><div>常规</div><div class="c">界面</div><div class="c">主页</div><div class="c s">搜索</div><div class="c">结果</div><div class="c">视图</div><div class="c">右键菜单</div><div class="c">字体和颜色</div><div class="c">键盘</div><div class="c">历史</div><div>索引</div><div class="c">NTFS</div><div class="c">ReFS</div><div class="c">文件夹</div><div class="c">文件列表</div><div class="c">排除</div><div>ETP/FTP 服务器</div><div>HTTP 服务器</div></div>
+  <div class="page"><h3>搜索</h3>
+   <fieldset><legend>匹配</legend>
+   <label><input type="checkbox" checked> 输入时即搜索</label>
+   <label><input type="checkbox" checked> 搜索词含路径分隔符时匹配完整路径</label>
+   <label><input type="checkbox" checked> 使用通配符时匹配完整文件名</label>
+   <label><input type="checkbox" checked> 快速 ASCII 搜索</label>
+   <label><input type="checkbox"> 允许字面量运算符 (AND / OR / NOT)</label>
+   <label><input type="checkbox" checked> 允许圆括号分组</label>
+   <label>运算符优先级： <select><option>OR &gt; AND</option><option>AND &gt; OR</option></select></label></fieldset>
+   <fieldset><legend>行为</legend>
+   <label><input type="checkbox"> 搜索为空时隐藏结果</label>
+   <label><input type="checkbox" checked> 搜索改变时清除选择</label>
+   <label><input type="checkbox"> 回车时聚焦运行次数最多的结果</label>
+   <label><input type="checkbox" checked> 展开环境变量</label></fieldset>
+  </div></div>
+ <div class="btns"><button>恢复默认</button><span style="flex:1"></span><button>确定</button><button>取消</button><button>应用</button></div>
+</div>
+<h2>选项对话框 v2 — 键盘页（全局显示/隐藏热键）</h2>
+<div class="win dlg" style="width:680px">
+ <div class="title"><div class="t">选项</div><div class="b x">✕</div></div>
+ <div class="body">
+  <div class="tree"><div>常规</div><div class="c">界面</div><div class="c">主页</div><div class="c">搜索</div><div class="c">结果</div><div class="c">视图</div><div class="c">右键菜单</div><div class="c">字体和颜色</div><div class="c s">键盘</div><div class="c">历史</div><div>索引</div><div class="c">NTFS</div><div class="c">ReFS</div><div class="c">文件夹</div><div class="c">文件列表</div><div class="c">排除</div><div>ETP/FTP 服务器</div><div>HTTP 服务器</div></div>
+  <div class="page"><h3>键盘</h3>
+   <fieldset><legend>全局热键</legend>
+   <label>显示/隐藏窗口：<span class="hk f">Ctrl + Alt + Space</span> <button style="min-width:50px">清除</button></label>
+   <label><input type="checkbox"> 双击 Ctrl 显示/隐藏窗口</label>
+   <label>新建窗口：　　<span class="hk">Ctrl + Alt + N</span> <button style="min-width:50px">清除</button><span class="err">⚠ 该热键已被其他程序占用</span></label>
+   <label>显示窗口：　　<span class="hk" style="color:#888">无</span> <button style="min-width:50px">清除</button></label>
+   <div style="color:#666;margin-top:4px">点击输入框后直接按下组合键录入；Backspace 清除。窗口显示在鼠标所在显示器。</div></fieldset>
+   <fieldset><legend>窗口</legend>
+   <label><input type="checkbox" checked> Esc 隐藏窗口到托盘（搜索框非空时先清空）</label>
+   <label><input type="checkbox" checked> 显示窗口时全选搜索框文字</label>
+   <label>Ctrl + 滚轮：<select><option>缩放字体</option><option>缩放缩略图</option><option>无</option></select></label></fieldset>
+   <fieldset><legend>命令快捷键</legend>
+   <table style="font-size:12px"><tr><th>命令</th><th>快捷键</th></tr><tr><td>文件 › 新建搜索窗口</td><td>Ctrl+N</td></tr><tr class="sel"><td>工具 › 选项</td><td>Ctrl+P</td></tr><tr><td>搜索 › 区分大小写</td><td>Ctrl+I</td></tr></table></fieldset>
+  </div></div>
+ <div class="btns"><button>恢复默认</button><span style="flex:1"></span><button>确定</button><button>取消</button><button>应用</button></div>
+</div>
+</body></html>
