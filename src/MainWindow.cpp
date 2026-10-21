@@ -1,6 +1,8 @@
 #include "Fold.h"
 #include "MainWindow.h"
 #include "NtfsSource.h"
+#include "Options.h"
+#include "Fold.h"
 #include <shellapi.h>
 #include <algorithm>
 #include "Dpi.h"
@@ -23,6 +25,7 @@ enum : int {
     IDM_INSTALL_SVC,
     IDM_UNINSTALL_SVC,
     IDC_SVC_BTN,
+    IDM_OPTIONS,
 };
 
 // 过滤器（与 Everything 默认过滤器相同的扩展名表）
@@ -178,6 +181,7 @@ void MainWindow::BuildMenu() {
     AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(theme), L"主题(&T)");
     HMENU tools = CreatePopupMenu();
     AppendMenuW(tools, MF_STRING, IDM_DOUBLE_CTRL, L"双击 Ctrl 显示/隐藏");
+    AppendMenuW(tools, MF_STRING, IDM_OPTIONS, L"选项(&O)…\tCtrl+P");
     AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(tools, MF_STRING, IDM_INSTALL_SVC, L"安装 FlashFind 服务(&I)…");
     AppendMenuW(tools, MF_STRING, IDM_UNINSTALL_SVC, L"卸载 FlashFind 服务(&U)…");
@@ -594,6 +598,7 @@ bool MainWindow::PreTranslate(MSG& msg) {
     if ((ctrl && k == 'F') || k == VK_F3 || (alt && k == 'D')) { SetFocus(edit_); SendMessageW(edit_, EM_SETSEL, 0, -1); return true; }
     if (k == VK_F5) { StartIndex(true); return true; }
     if (ctrl && k == 'Q') { DestroyWindow(hwnd_); return true; }
+    if (ctrl && k == 'P') { PostMessageW(hwnd_, WM_COMMAND, IDM_OPTIONS, 0); return true; }
     if (ctrl && k == 'W') { HideToTray(); return true; }
 
     if (msg.hwnd == edit_) {
@@ -680,6 +685,22 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         case IDM_REINDEX: StartIndex(true); break;
         case IDM_THEME_SYSTEM: case IDM_THEME_LIGHT: case IDM_THEME_DARK:
             GetSettings().theme = static_cast<ThemeMode>(id - IDM_THEME_SYSTEM); ApplyTheme(); break;
+        case IDM_OPTIONS: {
+            auto r = ShowOptions(hwnd_);
+            if (!r.applied) break;
+            auto& s = GetSettings();
+            g_fastAscii = s.fastAsciiSearch;
+            if (r.hotkeyChanged) {
+                hotkeys_.UnregisterToggle();
+                hotkeyFailed_ = !hotkeys_.RegisterToggle(hwnd_, s.toggleKey);
+                if (s.doubleCtrl) hotkeys_.EnableDoubleCtrl(hwnd_); else hotkeys_.DisableDoubleCtrl();
+                if (hotkeyFailed_) MessageBoxW(hwnd_, (L"全局热键 " + s.toggleKey + L" 已被其他程序占用。").c_str(), kAppName, MB_ICONWARNING);
+            }
+            ApplyTheme();
+            if (r.indexChanged) StartIndex(false); else RunSearch();
+            UpdateStatus();
+            break;
+        }
         case IDM_INSTALL_SVC: case IDC_SVC_BTN: ServiceAction(true); break;
         case IDM_UNINSTALL_SVC: ServiceAction(false); break;
         case IDM_DOUBLE_CTRL:

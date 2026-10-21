@@ -16,6 +16,8 @@
 #include <winioctl.h>
 #include <sddl.h>
 #include "NtfsSource.h"
+#include "Options.h"
+#include "Hotkey.h"
 #include "Log.h"
 
 namespace ff {
@@ -370,6 +372,13 @@ static int IniTest() {
     check(PathFiltered(L"C:\\other.txt", false, {}, inc) && !PathFiltered(L"C:\\work", true, {}, inc) && !PathFiltered(L"C:\\WORK\\SRC\\a.c", false, {}, inc), L"仅包含：祖先文件夹保留，范围外丢弃（不区分大小写）");
     DeleteFileW(ini.c_str());
     out += fails ? L"[result] FAIL\r\n" : L"[result] PASS\r\n";
+    {   // 热键字符串往返（选项对话框）
+        bool ok = true;
+        for (const wchar_t* k : {L"Ctrl+Alt+Space", L"Ctrl+Shift+F", L"Alt+F12", L"Ctrl+`", L"Ctrl+Alt+Shift+Win+Tab", L"Ctrl+9"}) {
+            HotkeyDef hd = ParseHotkey(k); if (FormatHotkey(hd.mods, hd.vk) != k) ok = false;
+        }
+        check(ok, L"热键 Parse/Format 往返");
+    }
     WriteOut(L"ff_initest.txt", out);
     return fails ? 1 : 0;
 }

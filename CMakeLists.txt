@@ -22,6 +22,7 @@ add_executable(FlashFind WIN32
     src/Hotkey.cpp src/Hotkey.h
     src/Dpi.h
     src/Util.h
+    src/Options.cpp src/Options.h
     src/NtfsSource.cpp src/NtfsSource.h src/Service.cpp
     src/MftIndexer.cpp
     src/Usn.cpp src/Usn.h
