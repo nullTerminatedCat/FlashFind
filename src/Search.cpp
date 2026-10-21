@@ -493,7 +493,18 @@ std::vector<uint32_t> BuildFolderPathRank(const IndexData& d) {
 
 void SortItems(const IndexData& d, std::vector<uint32_t>& items, SortSpec s, const std::vector<uint32_t>* folderRank) {
     const size_t n = items.size();
-    if (s.col == SortCol::Name) { if (s.desc) std::reverse(items.begin(), items.end()); return; }
+    // 名称：不假设输入已按名称排列；键 = 该对象在 byName（CompareFold 排好的全局名称序）中的位置
+    std::vector<uint32_t> namePos;
+    if (s.col == SortCol::Name && n * 64 < d.byName.size()) {   // 结果少：直接比较名称（与 byName 同序：折叠比较，同名按 id）
+        auto lt = [&](uint32_t a, uint32_t b) { int c = CompareFold(d.Name(a), d.Name(b)); return c != 0 ? c < 0 : a < b; };
+        if (s.desc) std::sort(items.begin(), items.end(), [&](uint32_t a, uint32_t b) { return lt(b, a); });
+        else std::sort(items.begin(), items.end(), lt);
+        return;
+    }
+    if (s.col == SortCol::Name) {
+        namePos.assign(d.entries.size(), UINT32_MAX);
+        for (size_t k = 0; k < d.byName.size(); ++k) namePos[d.byName[k]] = static_cast<uint32_t>(k);
+    }
     struct K { uint64_t k; uint32_t pos; uint32_t id; };
     std::vector<K> v(n);
     const bool desc = s.desc;
@@ -506,6 +517,7 @@ void SortItems(const IndexData& d, std::vector<uint32_t>& items, SortSpec s, con
             switch (s.col) {
             case SortCol::Size: key = en.IsDir() ? 0 : en.size + 1; break;     // 文件夹排在最小处
             case SortCol::Date: key = en.mtime; break;
+            case SortCol::Name: key = namePos[i]; break;
             default: key = en.parent == kNoParent || !folderRank ? 0 : (*folderRank)[en.parent]; break;
             }
             v[k] = {desc ? ~key : key, static_cast<uint32_t>(k), i};

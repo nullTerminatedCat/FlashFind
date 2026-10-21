@@ -56,6 +56,8 @@ target_compile_definitions(FlashFind PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEA
     _WIN32_WINNT=0x0A00 FLASHFIND_VERSION=L"${PROJECT_VERSION}")
 if(MSVC)
     target_compile_options(FlashFind PRIVATE /utf-8 /W4 /permissive-)
+    target_compile_options(FlashFind PRIVATE $<$<CONFIG:Release>:/Zi>)   # Release 也生成 PDB（不随包发布），便于解析崩溃栈
+    target_link_options(FlashFind PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
     target_link_options(FlashFind PRIVATE /MANIFEST:NO)  # 使用 rc 内嵌的 app.manifest
 endif()
 target_link_libraries(FlashFind PRIVATE pcre2-16-static comctl32 uxtheme dwmapi shell32 shlwapi ole32 d2d1 dwrite cabinet psapi advapi32)

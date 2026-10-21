@@ -42,6 +42,18 @@ HWND ResultList::Create(HWND parent, int id) {
     return hwnd_;
 }
 
+// 同列切换升/降序；新列：名称/路径升序，大小/时间降序
+void ResultList::ClickColumn(int c) {
+    if (c < 0 || c >= ColCount) return;
+    SortSpec s = sort_;
+    SortCol col = static_cast<SortCol>(c);
+    if (s.col == col) s.desc = !s.desc; else { s.col = col; s.desc = col == SortCol::Size || col == SortCol::Date; }
+    SetSort(s);
+    auto& st = GetSettings(); st.sortCol = static_cast<int>(s.col); st.sortDesc = s.desc;
+    ++sortClicks_;
+    PostMessageW(GetParent(hwnd_), WM_APP_SORT, 0, 0);
+}
+
 void ResultList::SetSort(SortSpec s) {
     sort_ = s;
     HWND hdr = ListView_GetHeader(hwnd_);
@@ -173,6 +185,16 @@ LRESULT CALLBACK ResultList::SubclassProc(HWND h, UINT m, WPARAM w, LPARAM l, UI
         auto* nm = reinterpret_cast<NMHDR*>(l);
         if (nm->hwndFrom == ListView_GetHeader(h)) {
             if (nm->code == NM_RCLICK) { POINT pt; GetCursorPos(&pt); self->ColumnMenu(pt); return TRUE; }
+            if (nm->code == HDN_ITEMCLICKW || nm->code == HDN_ITEMCLICKA || nm->code == HDN_ITEMDBLCLICKW || nm->code == HDN_ITEMDBLCLICKA) {   // 快速连点第二下是双击   // 列头点击排序（不依赖 LVN_COLUMNCLICK 是否转发到主窗口）
+                auto* hn = reinterpret_cast<NMHEADERW*>(l);
+                // 双击时：第二下按下发 ITEMDBLCLICK，松开可能再发 ITEMCLICK —— 只算一次
+                bool dbl = nm->code == HDN_ITEMDBLCLICKW || nm->code == HDN_ITEMDBLCLICKA;
+                ULONGLONG now = GetTickCount64();
+                bool dup = !dbl && hn->iItem == self->lastDblCol_ && now - self->lastDblTick_ < 300;
+                if (dbl) { self->lastDblCol_ = hn->iItem; self->lastDblTick_ = now; }
+                if (hn->iButton == 0 && !dup) self->ClickColumn(hn->iItem);
+                return 0;
+            }
             if (nm->code == HDN_BEGINTRACKW || nm->code == HDN_BEGINTRACKA || nm->code == HDN_DIVIDERDBLCLICKW || nm->code == HDN_DIVIDERDBLCLICKA) {
                 int c = reinterpret_cast<NMHEADERW*>(l)->iItem;
                 if (!self->ColumnVisible(c)) return TRUE;   // 隐藏列不可拖宽
@@ -422,17 +444,7 @@ bool ResultList::OnNotify(NMHDR* nm, LRESULT* out) {
         }
         return true;
     }
-    case LVN_COLUMNCLICK: {   // 同列切换升/降序；新列：名称/路径升序，大小/时间降序
-        auto* lv = reinterpret_cast<NMLISTVIEW*>(nm);
-        SortCol c = static_cast<SortCol>(lv->iSubItem);
-        SortSpec s = sort_;
-        if (s.col == c) s.desc = !s.desc; else { s.col = c; s.desc = c == SortCol::Size || c == SortCol::Date; }
-        SetSort(s);
-        auto& st = GetSettings(); st.sortCol = static_cast<int>(s.col); st.sortDesc = s.desc;
-        PostMessageW(GetParent(hwnd_), WM_APP_SORT, 0, 0);
-        *out = 0;
-        return true;
-    }
+    case LVN_COLUMNCLICK: *out = 0; return true;   // 已在列表子类化中按 HDN_ITEMCLICK 处理
     case LVN_ENDSCROLL: InvalidateRect(hwnd_, nullptr, FALSE); *out = 0; return true;
     case LVN_ODFINDITEMW: {   // 键入跳转：名称前缀（折叠比较）
         auto* fi = reinterpret_cast<NMLVFINDITEMW*>(nm);

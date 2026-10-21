@@ -22,6 +22,8 @@ public:
     void ApplyTheme();
     SortSpec Sort() const { return sort_; }
     void SetSort(SortSpec s);
+    void ClickColumn(int c);
+    int SortClicks() const { return sortClicks_; }
     void SetFont(HFONT f, HFONT bold, int rowHeight);
     bool OnNotify(NMHDR* nm, LRESULT* out);
 
@@ -48,7 +50,7 @@ private:
     void UpdateHiddenColumns();
 
     HWND hwnd_ = nullptr;
-    SortSpec sort_;
+    SortSpec sort_; int sortClicks_ = 0; int lastDblCol_ = -1; ULONGLONG lastDblTick_ = 0;
     std::shared_ptr<SearchResult> res_;
     static constexpr size_t kRowBuf = 4096;
     wchar_t rowBuf_[kRowBuf];

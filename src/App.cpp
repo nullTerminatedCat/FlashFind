@@ -744,6 +744,80 @@ static int ScrollTest() {
     return fails ? 1 : 0;
 }
 
+// -sortclicktest：真实鼠标点击列头（SendInput）-> 排序 -> 搜索线程 -> 结果，逐列升/降序校验
+namespace sct {
+ResultList* g_list; Searcher* g_s; std::shared_ptr<IndexData> g_d; int g_lvnClicks = 0;
+LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_NOTIFY: { auto* nm = reinterpret_cast<NMHDR*>(l); if (nm->code == LVN_COLUMNCLICK) ++g_lvnClicks; LRESULT o = 0; if (g_list && g_list->OnNotify(nm, &o)) return o; return 0; }
+    case WM_APP_SORT: g_s->Request(L"", g_d, g_list->Sort()); return 0;
+    case WM_APP_RESULTS: { auto r = g_s->Latest(); if (r && r->generation == w) g_list->SetResultsForTest(r); return 0; }
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+}
+static int SortClickTest() {
+    std::wstring out; wchar_t buf[512]; int fails = 0;
+    OleInitialize(nullptr);
+    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_LISTVIEW_CLASSES}; InitCommonControlsEx(&icc);
+    GetTheme().Resolve(ThemeMode::Light);
+    GetSettings().sortCol = 0; GetSettings().sortDesc = false;
+    for (int c = 0; c < 4; ++c) GetSettings().colVisible[c] = true;
+    WNDCLASSW wc{}; wc.lpfnWndProc = sct::Proc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"FFSortClick"; RegisterClassW(&wc);
+    HWND top = CreateWindowExW(WS_EX_TOPMOST, L"FFSortClick", L"sortclicktest", WS_POPUP | WS_VISIBLE, 60, 60, 900, 500, nullptr, nullptr, wc.hInstance, nullptr);
+    ResultList list; sct::g_list = &list; HWND lv = list.Create(top, 1);
+    MoveWindow(lv, 0, 0, 900, 500, TRUE);
+    ListView_SetColumnWidth(lv, 0, 220); ListView_SetColumnWidth(lv, 1, 300); ListView_SetColumnWidth(lv, 2, 120); ListView_SetColumnWidth(lv, 3, 200);
+    auto d = Synthesize(30000);
+    for (size_t i = 0; i < d->entries.size(); ++i) { auto& e = d->entries.Mut(i); e.mtime = 133000000000000000ULL + (i * 2654435761ULL) % 100000000000ULL; if (!e.IsDir()) e.size = (i * 40503ULL) % 1000000; }
+    sct::g_d = d;
+    Searcher s(top); sct::g_s = &s;
+    auto rank = BuildFolderPathRank(*d);
+    SetForegroundWindow(top);
+    auto pump = [](int ms) { MSG m; ULONGLONG end = GetTickCount64() + ms; while (GetTickCount64() < end) { while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); } Sleep(5); } };
+    s.Request(L"", d, list.Sort()); pump(400);
+    HWND hdr = ListView_GetHeader(lv);
+    auto click = [&](int c) {
+        RECT r; Header_GetItemRect(hdr, c, &r); POINT p{(r.left + r.right) / 2, (r.top + r.bottom) / 2}; ClientToScreen(hdr, &p);
+        SetCursorPos(p.x, p.y);
+        INPUT in[2]{}; in[0].type = in[1].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN; in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        SendInput(2, in, sizeof(INPUT));
+        pump(500);
+    };
+    const wchar_t* cn[] = {L"名称", L"路径", L"大小", L"时间"};
+    auto key = [&](int c, uint32_t i) -> uint64_t { const Entry& e = d->entries[i];
+        return c == 2 ? (e.IsDir() ? 0 : e.size + 1) : c == 3 ? e.mtime : (e.parent == kNoParent ? 0 : rank[e.parent]); };
+    // 名称当前升序：点 路径(升) 路径(降) 大小(降) 大小(升) 时间(降) 时间(升) 名称(升) 名称(降)
+    int seq[] = {1, 1, 2, 2, 3, 3, 0, 0};
+    for (int c : seq) {
+        int before = list.SortClicks();
+        click(c);
+        auto* r = list.Results();
+        SortSpec so = list.Sort();
+        bool ok = r && r->items.size() == d->byName.size() && so.col == static_cast<SortCol>(c) && list.SortClicks() == before + 1 && r->sort == so;
+        for (size_t k = 1; ok && k < r->items.size(); ++k) {
+            uint32_t a = r->items[k - 1], b = r->items[k];
+            if (c == 0) { int cmp = CompareFold(d->Name(a), d->Name(b)); if (so.desc ? cmp < 0 : cmp > 0) ok = false; }
+            else { uint64_t ka = key(c, a), kb = key(c, b); if (so.desc ? ka < kb : ka > kb) ok = false; }
+        }
+        HDITEMW hi{HDI_FORMAT}; Header_GetItem(hdr, c, &hi);
+        bool arrow = (hi.fmt & (so.desc ? HDF_SORTDOWN : HDF_SORTUP)) != 0;
+        swprintf_s(buf, L"  %s 点击 %s -> %s%s  箭头=%d\r\n", ok && arrow ? L"[OK]  " : L"[FAIL]", cn[c], cn[static_cast<int>(so.col)], so.desc ? L"降" : L"升", arrow); out += buf;
+        if (!ok || !arrow) ++fails;
+    }
+    swprintf_s(buf, L"[diag] 主窗口收到 LVN_COLUMNCLICK %d 次，排序点击 %d 次\r\n", sct::g_lvnClicks, list.SortClicks()); out += buf;
+    {   // 名称排序不依赖输入顺序：打乱后排序
+        std::vector<uint32_t> it = d->byName; std::reverse(it.begin(), it.end()); std::rotate(it.begin(), it.begin() + it.size() / 3, it.end());
+        SortItems(*d, it, {SortCol::Name, false}, nullptr);
+        bool ok = it == d->byName; out += ok ? L"  [OK]   名称排序：乱序输入也正确\r\n" : L"  [FAIL] 名称排序：乱序输入\r\n"; if (!ok) ++fails;
+    }
+    sct::g_list = nullptr;
+    DestroyWindow(top);
+    swprintf_s(buf, L"[result] %s (%d failed)\r\n", fails ? L"FAIL" : L"PASS", fails); out += buf;
+    WriteOut(L"ff_sortclicktest.txt", out);
+    return fails ? 1 : 0;
+}
+
 // -icontest [db]：真实图标（SHGetFileInfo 读文件）与按扩展名图标的耗时对比
 static int IconTest(std::wstring dbPath) {
     std::wstring out; wchar_t buf[512];
@@ -899,6 +973,7 @@ int App::Run(HINSTANCE inst, int show) {
         if (mode == L"-install-service") return InstallService();
         if (mode == L"-uninstall-service") return UninstallService();
         if (mode == L"-icontest") { InitFold(); return IconTest(arg); }
+        if (mode == L"-sortclicktest") { InitFold(); g_fastAscii = true; return SortClickTest(); }
         if (mode == L"-scrolltest") { InitFold(); return ScrollTest(); }
         if (mode == L"-regextest") { InitFold(); g_fastAscii = true; return RegexTest(arg); }
         if (mode == L"-syntaxtest") { InitFold(); g_fastAscii = true; return SyntaxTest(arg); }
