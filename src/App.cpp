@@ -611,6 +611,30 @@ static int SyntaxTest(std::wstring dbPath) {
     return fails ? 1 : 0;
 }
 
+// -icontest [db]：真实图标（SHGetFileInfo 读文件）与按扩展名图标的耗时对比
+static int IconTest(std::wstring dbPath) {
+    std::wstring out; wchar_t buf[512];
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    std::wstring err; if (dbPath.empty()) dbPath = Indexer::DefaultDbPath();
+    auto d = LoadDb(dbPath, err);
+    if (!d) { WriteOut(L"ff_icontest.txt", L"[skip] 无数据库\r\n"); return 0; }
+    std::vector<std::wstring> paths;
+    for (uint32_t i : d->byName) { auto n = d->Name(i); if (n.size() > 4 && CompareFold(n.substr(n.size() - 4), L".exe") == 0) { paths.push_back(d->FullPath(i)); if (paths.size() >= 200) break; } }
+    double a = NowMs(); SHFILEINFOW sfi{};
+    for (auto& p : paths) SHGetFileInfoW(p.c_str(), 0, &sfi, sizeof(sfi), SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+    double real = NowMs() - a;
+    a = NowMs();
+    for (auto& p : paths) SHGetFileInfoW(p.c_str(), 0, &sfi, sizeof(sfi), SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+    double warm = NowMs() - a;
+    a = NowMs();
+    for (size_t k = 0; k < paths.size(); ++k) SHGetFileInfoW(L"x.exe", FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi), SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
+    double ext = NowMs() - a;
+    swprintf_s(buf, L"[icon] %zu 个 exe：真实图标首次 %.2f ms/个，再次 %.2f ms/个；按扩展名 %.3f ms/个\r\n", paths.size(), real / std::max<size_t>(1, paths.size()), warm / std::max<size_t>(1, paths.size()), ext / std::max<size_t>(1, paths.size()));
+    out += buf;
+    WriteOut(L"ff_icontest.txt", out);
+    return 0;
+}
+
 // -pipetest：启动 -svc-console（非服务的同一管道服务器），通过管道测试协议
 static int PipeTest(std::wstring vol) {
     std::wstring out; wchar_t buf[2048]; int fails = 0;
@@ -714,6 +738,7 @@ int App::Run(HINSTANCE inst, int show) {
         if (mode == L"-svc-console") return SvcConsole();
         if (mode == L"-install-service") return InstallService();
         if (mode == L"-uninstall-service") return UninstallService();
+        if (mode == L"-icontest") { InitFold(); return IconTest(arg); }
         if (mode == L"-syntaxtest") { InitFold(); g_fastAscii = true; return SyntaxTest(arg); }
         if (mode == L"-sorttest") { InitFold(); g_fastAscii = true; return SortTest(arg); }
         if (mode == L"-wildtest") { InitFold(); g_fastAscii = true; return WildTest(arg); }

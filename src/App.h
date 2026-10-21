@@ -11,7 +11,8 @@ enum : UINT {
     WM_APP_TRAY,                       // 托盘回调
     WM_APP_TOGGLE,                     // 热键/双击 Ctrl/第二实例 -> 显示或隐藏
     WM_APP_SHOW,
-    WM_APP_SORT,                       // 列头点击改变排序                       // 第二实例 -> 仅显示
+    WM_APP_SORT,
+    WM_APP_ICONS,                      // 后台真实图标已就绪                       // 列头点击改变排序                       // 第二实例 -> 仅显示
 };
 
 constexpr const wchar_t* kMainClass = L"FlashFind.MainWindow";

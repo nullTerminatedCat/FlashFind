@@ -6,6 +6,7 @@
 #include "Util.h"
 #include "App.h"
 #include <shellapi.h>
+#include <objbase.h>
 #include <uxtheme.h>
 #include <algorithm>
 
@@ -52,7 +53,37 @@ void ResultList::SetSort(SortSpec s) {
     }
 }
 
+bool ResultList::WantsRealIcon(std::wstring_view ext) {
+    static const wchar_t* k[] = {L".exe", L".lnk", L".ico", L".url", L".cur", L".ani", L".scr", L".msc", L".cpl", L".appref-ms"};
+    for (auto e : k) { std::wstring_view v(e); if (v.size() == ext.size() && CompareFold(v, ext) == 0) return true; }
+    return false;
+}
+
+void ResultList::IconWorker() {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    for (;;) {
+        std::wstring path;
+        {
+            std::unique_lock lk(iconMu_);
+            iconCv_.wait(lk, [&] { return iconQuit_ || !iconQ_.empty(); });
+            if (iconQuit_) break;
+            path = std::move(iconQ_.back()); iconQ_.pop_back();
+        }
+        SHFILEINFOW sfi{};
+        int idx = SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof(sfi), SHGFI_SYSICONINDEX | SHGFI_SMALLICON) ? sfi.iIcon : -2;
+        {
+            std::lock_guard lk(iconMu_);
+            iconPending_.erase(path);
+            if (realIcon_.size() > 100000) realIcon_.clear();
+            realIcon_[path] = idx;
+        }
+        if (!iconPosted_.exchange(true)) PostMessageW(hwnd_, WM_APP_ICONS, 0, 0);
+    }
+    CoUninitialize();
+}
+
 ResultList::~ResultList() {
+    if (!iconTh_.empty()) { { std::lock_guard lk(iconMu_); iconQuit_ = true; } iconCv_.notify_all(); for (auto& t : iconTh_) t.join(); }
     if (memDc_) { SelectObject(memDc_, memOld_); DeleteObject(memBmp_); DeleteDC(memDc_); }
     if (rowHeightIl_) ImageList_Destroy(rowHeightIl_);
 }
@@ -61,6 +92,7 @@ LRESULT CALLBACK ResultList::SubclassProc(HWND h, UINT m, WPARAM w, LPARAM l, UI
     auto* self = reinterpret_cast<ResultList*>(ref);
     switch (m) {
     case WM_ERASEBKGND: return 1;
+    case WM_APP_ICONS: self->iconPosted_ = false; InvalidateRect(h, nullptr, FALSE); return 0;
     case WM_PAINT: {
         if (w) { RECT rc; GetClientRect(h, &rc); self->Paint(reinterpret_cast<HDC>(w), rc); return 0; }
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
@@ -100,6 +132,11 @@ void ResultList::SetFont(HFONT f, HFONT bold, int rowHeight) {
 }
 
 void ResultList::SetResults(std::shared_ptr<SearchResult> r) {
+    {   // 旧结果的图标请求不再需要
+        std::lock_guard lk(iconMu_);
+        for (auto& p : iconQ_) iconPending_.erase(p);
+        iconQ_.clear();
+    }
     res_ = std::move(r);
     int n = res_ ? static_cast<int>(res_->items.size()) : 0;
     ListView_SetItemState(hwnd_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
@@ -135,6 +172,18 @@ int ResultList::IconFor(uint32_t i) {
     if (ext.size() > 16) ext = {};
     uint64_t h = 1469598103934665603ULL;
     for (wchar_t c : ext) { h ^= static_cast<uint16_t>(Fold(c)); h *= 1099511628211ULL; }
+    if (WantsRealIcon(ext)) {
+        std::wstring path = d.FullPath(i);
+        std::lock_guard lk(iconMu_);
+        auto rit = realIcon_.find(path);
+        if (rit != realIcon_.end()) { if (rit->second >= 0) return rit->second; }
+        else if (iconPending_.insert(path).second) {
+            iconQ_.push_back(std::move(path));
+            if (iconQ_.size() > 512) { for (size_t k = 0; k < 256; ++k) iconPending_.erase(iconQ_[k]); iconQ_.erase(iconQ_.begin(), iconQ_.begin() + 256); }
+            if (iconTh_.empty()) for (int k = 0; k < 4; ++k) iconTh_.emplace_back([this] { IconWorker(); });
+            iconCv_.notify_one();
+        }
+    }
     auto it = iconCache_.find(h);
     if (it != iconCache_.end()) return it->second;
     wchar_t fake[24] = L"x";

@@ -4,6 +4,10 @@
 #include "Search.h"
 #include <commctrl.h>
 #include <unordered_map>
+#include <unordered_set>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 namespace ff {
 
@@ -33,6 +37,8 @@ private:
     void DrawRow(HDC dc, int row, const RECT& rowRc, const RECT* cols, bool focused);
     void DrawName(HDC dc, const RECT& rc, uint32_t i, bool selected);
     int IconFor(uint32_t i);
+    void IconWorker();
+    static bool WantsRealIcon(std::wstring_view ext);
 
     HWND hwnd_ = nullptr;
     SortSpec sort_;
@@ -42,6 +48,15 @@ private:
     char mask_[kRowBuf];
     std::unordered_map<uint64_t, int> iconCache_;   // 扩展名哈希 -> 图标序号
     int folderIcon_ = -1;
+    // 真实图标（exe/lnk/ico 等）：只为可见行请求，后台线程 SHGetFileInfo，完成后重绘
+    std::mutex iconMu_;
+    std::condition_variable iconCv_;
+    std::vector<std::wstring> iconQ_;                 // 栈：最新请求优先
+    std::unordered_set<std::wstring> iconPending_;
+    std::unordered_map<std::wstring, int> realIcon_;  // 完整路径 -> 系统图标序号
+    std::vector<std::thread> iconTh_;   // 4 个工作线程（冷启动每个 exe 约 70 ms，磁盘/签名读取）
+    bool iconQuit_ = false;
+    std::atomic<bool> iconPosted_{false};
     HFONT font_ = nullptr, bold_ = nullptr;
     int rowH_ = 26;
     HDC memDc_ = nullptr; HBITMAP memBmp_ = nullptr; HGDIOBJ memOld_ = nullptr; int memW_ = 0, memH_ = 0;
