@@ -1,8 +1,9 @@
 #include "ResultList.h"
+#include "Dpi.h"
+#include "Fold.h"
 #include "Settings.h"
 #include "Theme.h"
 #include "Util.h"
-#include "Dpi.h"
 #include <shellapi.h>
 #include <uxtheme.h>
 #include <algorithm>
@@ -13,13 +14,13 @@ static HIMAGELIST g_sysImages = nullptr;
 
 HWND ResultList::Create(HWND parent, int id) {
     hwnd_ = CreateWindowExW(0, WC_LISTVIEWW, L"",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPCHILDREN | LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS,
         0, 0, 100, 100, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
-    ListView_SetExtendedListViewStyle(hwnd_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP | LVS_EX_INFOTIP);
+    ListView_SetExtendedListViewStyle(hwnd_, LVS_EX_FULLROWSELECT | LVS_EX_HEADERDRAGDROP);
+    SetWindowSubclass(hwnd_, SubclassProc, 1, reinterpret_cast<DWORD_PTR>(this));
 
     SHFILEINFOW sfi{};
     g_sysImages = reinterpret_cast<HIMAGELIST>(SHGetFileInfoW(L"C:\\", 0, &sfi, sizeof(sfi), SHGFI_SYSICONINDEX | SHGFI_SMALLICON));
-    ListView_SetImageList(hwnd_, g_sysImages, LVSIL_SMALL);
 
     auto& s = GetSettings();
     UINT dpi = DpiOf(parent);
@@ -33,7 +34,6 @@ HWND ResultList::Create(HWND parent, int id) {
         c.fmt = cols[i].fmt;
         ListView_InsertColumn(hwnd_, i, &c);
     }
-    // 名称列显示升序箭头（M1 固定按名称排序）
     HWND hdr = ListView_GetHeader(hwnd_);
     HDITEMW hi{HDI_FORMAT};
     Header_GetItem(hdr, 0, &hi);
@@ -41,6 +41,29 @@ HWND ResultList::Create(HWND parent, int id) {
     Header_SetItem(hdr, 0, &hi);
     ApplyTheme();
     return hwnd_;
+}
+
+ResultList::~ResultList() {
+    if (memDc_) { SelectObject(memDc_, memOld_); DeleteObject(memBmp_); DeleteDC(memDc_); }
+    if (rowHeightIl_) ImageList_Destroy(rowHeightIl_);
+}
+
+LRESULT CALLBACK ResultList::SubclassProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR ref) {
+    auto* self = reinterpret_cast<ResultList*>(ref);
+    switch (m) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        if (w) { RECT rc; GetClientRect(h, &rc); self->Paint(reinterpret_cast<HDC>(w), rc); return 0; }
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        self->Paint(dc, ps.rcPaint);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_PRINTCLIENT: { RECT rc; GetClientRect(h, &rc); self->Paint(reinterpret_cast<HDC>(w), rc); return 0; }
+    case WM_SETFOCUS: case WM_KILLFOCUS: InvalidateRect(h, nullptr, FALSE); break;
+    case WM_NCDESTROY: RemoveWindowSubclass(h, SubclassProc, 1); break;
+    }
+    return DefSubclassProc(h, m, w, l);
 }
 
 std::vector<int> ResultList::ColumnWidths() const {
@@ -53,17 +76,18 @@ std::vector<int> ResultList::ColumnWidths() const {
 void ResultList::ApplyTheme() {
     auto& t = GetTheme();
     SetWindowTheme(hwnd_, t.Dark() ? L"DarkMode_Explorer" : L"Explorer", nullptr);
-    HWND hdr = ListView_GetHeader(hwnd_);
-    SetWindowTheme(hdr, t.Dark() ? L"DarkMode_ItemsView" : L"ItemsView", nullptr);
+    SetWindowTheme(ListView_GetHeader(hwnd_), t.Dark() ? L"DarkMode_ItemsView" : L"ItemsView", nullptr);
     ListView_SetBkColor(hwnd_, t.P().surface);
-    ListView_SetTextBkColor(hwnd_, t.P().surface);
-    ListView_SetTextColor(hwnd_, t.P().text);
-    InvalidateRect(hwnd_, nullptr, TRUE);
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
-void ResultList::SetFont(HFONT f, HFONT bold) {
-    font_ = f; bold_ = bold;
+void ResultList::SetFont(HFONT f, HFONT bold, int rowHeight) {
+    font_ = f; bold_ = bold; rowH_ = rowHeight;
     SendMessageW(hwnd_, WM_SETFONT, reinterpret_cast<WPARAM>(f), TRUE);
+    // 让 ListView 内部的行高（滚动/命中测试）与我们绘制的一致
+    if (rowHeightIl_) ImageList_Destroy(rowHeightIl_);
+    rowHeightIl_ = ImageList_Create(1, rowHeight, ILC_COLOR, 1, 0);
+    ListView_SetImageList(hwnd_, rowHeightIl_, LVSIL_SMALL);
 }
 
 void ResultList::SetResults(std::shared_ptr<SearchResult> r) {
@@ -96,16 +120,19 @@ int ResultList::IconFor(uint32_t i) {
         }
         return folderIcon_;
     }
-    auto name = d.LowerName(i);
+    auto name = d.Name(i);
     auto dot = name.rfind(L'.');
-    std::wstring ext = dot == std::wstring_view::npos ? L"" : std::wstring(name.substr(dot));
-    auto it = iconCache_.find(ext);
+    std::wstring_view ext = dot == std::wstring_view::npos ? std::wstring_view{} : name.substr(dot);
+    if (ext.size() > 16) ext = {};
+    uint64_t h = 1469598103934665603ULL;
+    for (wchar_t c : ext) { h ^= static_cast<uint16_t>(Fold(c)); h *= 1099511628211ULL; }
+    auto it = iconCache_.find(h);
     if (it != iconCache_.end()) return it->second;
-    // 按扩展名取图标（不访问磁盘）；exe/lnk 的专属图标留给 M2 后台加载
+    wchar_t fake[24] = L"x";
+    wmemcpy(fake + 1, ext.data(), ext.size()); fake[1 + ext.size()] = 0;
     SHFILEINFOW sfi{};
-    std::wstring fake = L"x" + ext;
-    SHGetFileInfoW(fake.c_str(), FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi), SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
-    iconCache_[ext] = sfi.iIcon;
+    SHGetFileInfoW(fake, FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi), SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES);
+    iconCache_.emplace(h, sfi.iIcon);
     return sfi.iIcon;
 }
 
@@ -113,20 +140,17 @@ void ResultList::DrawName(HDC dc, const RECT& rc, uint32_t i, bool selected) {
     const auto& d = *res_->data;
     const auto& pal = GetTheme().P();
     std::wstring_view name = d.Name(i);
-    std::wstring_view lower = d.LowerName(i);
-    // 匹配掩码（成员缓冲区，无逐行分配）
-    if (name.size() > kRowBuf) { name = name.substr(0, kRowBuf); lower = lower.substr(0, kRowBuf); }
+    if (name.size() > kRowBuf) name = name.substr(0, kRowBuf);
     char* mask = mask_;
     memset(mask, 0, name.size());
     for (auto& t : res_->terms) {
         if (t.empty() || t.find(L'\\') != std::wstring::npos) continue;
-        for (size_t p = lower.find(t); p != std::wstring_view::npos; p = lower.find(t, p + 1))
+        for (size_t p = FindFold(name, t, 0); p != std::wstring_view::npos; p = FindFold(name, t, p + 1))
             memset(mask + p, 1, std::min(t.size(), name.size() - p));
     }
-    int x = rc.left;
-    int y = rc.top;
     TEXTMETRICW tm; GetTextMetricsW(dc, &tm);
-    int ty = y + ((rc.bottom - rc.top) - tm.tmHeight) / 2;
+    int x = rc.left;
+    int ty = rc.top + ((rc.bottom - rc.top) - tm.tmHeight) / 2;
     size_t k = 0;
     while (k < name.size() && x < rc.right) {
         size_t e = k;
@@ -134,9 +158,10 @@ void ResultList::DrawName(HDC dc, const RECT& rc, uint32_t i, bool selected) {
         bool hl = mask[k] != 0;
         HGDIOBJ old = SelectObject(dc, hl && bold_ ? bold_ : font_);
         SIZE sz; GetTextExtentPoint32W(dc, name.data() + k, static_cast<int>(e - k), &sz);
-        RECT seg{x, ty, std::min<LONG>(x + sz.cx, rc.right), ty + tm.tmHeight};
         if (hl && !selected) {
-            HBRUSH b = CreateSolidBrush(pal.hl); FillRect(dc, &seg, b); DeleteObject(b);
+            RECT seg{x, ty, std::min<LONG>(x + sz.cx, rc.right), ty + tm.tmHeight};
+            SetBkColor(dc, pal.hl);
+            ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &seg, nullptr, 0, nullptr);
             SetTextColor(dc, pal.hlText);
         } else {
             SetTextColor(dc, selected ? pal.selText : pal.text);
@@ -148,99 +173,120 @@ void ResultList::DrawName(HDC dc, const RECT& rc, uint32_t i, bool selected) {
     }
 }
 
-LRESULT ResultList::CustomDraw(NMLVCUSTOMDRAW* cd) {
-    switch (cd->nmcd.dwDrawStage) {
-    case CDDS_PREPAINT:
-        return CDRF_NOTIFYITEMDRAW;
-    case CDDS_ITEMPREPAINT: {
-        if (!res_) return CDRF_DODEFAULT;
-        int row = static_cast<int>(cd->nmcd.dwItemSpec);
-        if (row < 0 || static_cast<size_t>(row) >= res_->items.size()) return CDRF_DODEFAULT;
-        uint32_t i = res_->items[static_cast<size_t>(row)];
-        const auto& d = *res_->data;
-        const auto& pal = GetTheme().P();
-        HDC dc = cd->nmcd.hdc;
-        bool sel = ListView_GetItemState(hwnd_, row, LVIS_SELECTED) != 0;
-        bool focusList = GetFocus() == hwnd_;
-
-        RECT row_rc; ListView_GetItemRect(hwnd_, row, &row_rc, LVIR_BOUNDS);
-        COLORREF bg = sel ? pal.sel : ((row & 1) ? pal.alt : pal.surface);
-        if (sel && !focusList) bg = pal.hover;
-        HBRUSH b = CreateSolidBrush(bg); FillRect(dc, &row_rc, b); DeleteObject(b);
-        if (sel) { // 左侧强调条
-            UINT dpi = DpiOf(hwnd_);
-            RECT bar{row_rc.left, row_rc.top + Scale(5, dpi), row_rc.left + Scale(3, dpi), row_rc.bottom - Scale(5, dpi)};
-            HBRUSH ab = CreateSolidBrush(pal.accent); FillRect(dc, &bar, ab); DeleteObject(ab);
+void ResultList::DrawRow(HDC dc, int row, const RECT& rr, const RECT* cols, bool focused) {
+    const auto& pal = GetTheme().P();
+    uint32_t i = res_->items[static_cast<size_t>(row)];
+    const auto& d = *res_->data;
+    const auto& e = d.entries[i];
+    bool sel = ListView_GetItemState(hwnd_, row, LVIS_SELECTED) != 0;
+    COLORREF bg = sel ? (focused ? pal.sel : pal.hover) : ((row & 1) ? pal.alt : pal.surface);
+    SetBkColor(dc, bg);
+    ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &rr, nullptr, 0, nullptr);
+    UINT dpi = DpiOf(hwnd_);
+    if (sel) {
+        RECT bar{rr.left, rr.top + Scale(5, dpi), rr.left + Scale(3, dpi), rr.bottom - Scale(5, dpi)};
+        SetBkColor(dc, pal.accent);
+        ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &bar, nullptr, 0, nullptr);
+    }
+    SetBkMode(dc, TRANSPARENT);
+    int pad = Scale(6, dpi);
+    for (int c = 0; c < ColCount; ++c) {
+        RECT r{cols[c].left, rr.top, cols[c].right, rr.bottom};
+        if (r.right <= r.left) continue;
+        if (c == ColName) {
+            int isz = 16, isy = 16; ImageList_GetIconSize(g_sysImages, &isz, &isy);
+            int ix = r.left + pad;
+            ImageList_Draw(g_sysImages, IconFor(i), dc, ix, r.top + (rowH_ - isy) / 2, ILD_TRANSPARENT);
+            RECT t{ix + isz + pad, r.top, r.right - pad, r.bottom};
+            DrawName(dc, t, i, sel);
+            continue;
         }
-        SetBkMode(dc, TRANSPARENT);
-        HGDIOBJ oldFont = SelectObject(dc, font_);
-
-        // 名称列：图标 + 高亮文字
-        RECT ic; ListView_GetSubItemRect(hwnd_, row, 0, LVIR_ICON, &ic);
-        int iconIdx = IconFor(i);
-        int isz = 16; ImageList_GetIconSize(g_sysImages, &isz, &isz);
-        ImageList_Draw(g_sysImages, iconIdx, dc, ic.left + 4, ic.top + ((ic.bottom - ic.top) - isz) / 2, ILD_TRANSPARENT);
-        RECT lab; ListView_GetSubItemRect(hwnd_, row, 0, LVIR_LABEL, &lab);
-        lab.left += 6; lab.right -= 4;
-        DrawName(dc, lab, i, false);
-
-        auto& e = d.entries[i];
+        int len = 0;
+        if (c == ColPath) len = static_cast<int>(d.ParentPathInto(i, rowBuf_, kRowBuf));
+        else if (c == ColSize) len = e.IsDir() ? 0 : FormatSizeInto(e.size, rowBuf_, kRowBuf);
+        else len = FormatTimeInto(e.mtime, rowBuf_, kRowBuf);
+        RECT t{r.left + pad, r.top, r.right - pad, r.bottom};
         SetTextColor(dc, pal.text2);
-        for (int c = 1; c < ColCount; ++c) {
-            wchar_t* buf = rowBuf_; int len = 0;
-            if (c == ColPath) len = static_cast<int>(d.ParentPathInto(i, rowBuf_, kRowBuf));
-            else if (c == ColSize) len = e.IsDir() ? 0 : FormatSizeInto(e.size, rowBuf_, kRowBuf);
-            else len = FormatTimeInto(e.mtime, rowBuf_, kRowBuf);
-            RECT r; ListView_GetSubItemRect(hwnd_, row, c, LVIR_BOUNDS, &r);
-            r.left += 6; r.right -= 6;
-            DrawTextW(dc, buf, len, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS | (c == ColSize ? DT_RIGHT : DT_LEFT));
+        DrawTextW(dc, rowBuf_, len, &t, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS | (c == ColSize ? DT_RIGHT : DT_LEFT));
+    }
+    SetBkMode(dc, OPAQUE);
+}
+
+void ResultList::Paint(HDC target, const RECT& clip) {
+    RECT cl; GetClientRect(hwnd_, &cl);
+    int w = std::max<int>(1, cl.right), h = std::max<int>(1, cl.bottom);
+    if (!memDc_ || w > memW_ || h > memH_) {   // 双缓冲位图只在变大时重建
+        if (memDc_) { SelectObject(memDc_, memOld_); DeleteObject(memBmp_); DeleteDC(memDc_); }
+        memW_ = std::max(w, memW_); memH_ = std::max(h, memH_);
+        memDc_ = CreateCompatibleDC(target);
+        memBmp_ = CreateCompatibleBitmap(target, memW_, memH_);
+        memOld_ = SelectObject(memDc_, memBmp_);
+    }
+    HDC dc = memDc_;
+    const auto& pal = GetTheme().P();
+    SetBkColor(dc, pal.surface);
+    ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &cl, nullptr, 0, nullptr);
+
+    HWND hdr = ListView_GetHeader(hwnd_);
+    RECT hr{}; GetWindowRect(hdr, &hr); MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&hr), 2);
+    int top = hr.bottom;
+    RECT cols[ColCount]{}; int right = cl.right;
+    for (int c = 0; c < ColCount; ++c) {
+        RECT r{}; Header_GetItemRect(hdr, c, &r);
+        cols[c] = {r.left + hr.left, 0, r.right + hr.left, 0};
+        right = std::max<int>(right, cols[c].right);
+    }
+    HGDIOBJ of = SelectObject(dc, font_);
+    if (res_ && res_->data && !res_->items.empty()) {
+        int count = static_cast<int>(res_->items.size());
+        int first = ListView_GetTopIndex(hwnd_);
+        bool focused = GetFocus() == hwnd_;
+        for (int row = first; row < count; ++row) {
+            int y = top + (row - first) * rowH_;
+            if (y >= cl.bottom) break;
+            RECT rr{hr.left, y, right, y + rowH_};
+            if (rr.bottom <= clip.top || rr.top >= clip.bottom) continue;
+            DrawRow(dc, row, rr, cols, focused);
         }
-        SelectObject(dc, oldFont);
-        return CDRF_SKIPDEFAULT;
     }
-    }
-    return CDRF_DODEFAULT;
+    SelectObject(dc, of);
+    BitBlt(target, clip.left, std::max<int>(clip.top, top), clip.right - clip.left,
+           clip.bottom - std::max<int>(clip.top, top), dc, clip.left, std::max<int>(clip.top, top), SRCCOPY);
 }
 
 bool ResultList::OnNotify(NMHDR* nm, LRESULT* out) {
     if (nm->hwndFrom != hwnd_) return false;
     switch (nm->code) {
-    case LVN_GETDISPINFOW: {
+    case LVN_GETDISPINFOW: {   // 供无障碍/提示使用；绘制不走这里
         auto* di = reinterpret_cast<NMLVDISPINFOW*>(nm);
+        *out = 0;
         if (!res_ || di->item.iItem < 0 || static_cast<size_t>(di->item.iItem) >= res_->items.size()) return true;
         uint32_t i = res_->items[static_cast<size_t>(di->item.iItem)];
         const auto& d = *res_->data;
-        if (di->item.mask & LVIF_TEXT) {
+        if ((di->item.mask & LVIF_TEXT) && di->item.cchTextMax > 0) {
             wchar_t* o = di->item.pszText; size_t cap = static_cast<size_t>(di->item.cchTextMax);
-            if (cap) {
-                switch (di->item.iSubItem) {
-                case ColName: { auto nv = d.Name(i); size_t c = std::min(nv.size(), cap - 1); wmemcpy(o, nv.data(), c); o[c] = 0; break; }
-                case ColPath: d.ParentPathInto(i, o, cap); break;
-                case ColSize: if (d.entries[i].IsDir()) o[0] = 0; else FormatSizeInto(d.entries[i].size, o, cap); break;
-                case ColDate: FormatTimeInto(d.entries[i].mtime, o, cap); break;
-                }
+            switch (di->item.iSubItem) {
+            case ColName: { auto nv = d.Name(i); size_t c = std::min(nv.size(), cap - 1); wmemcpy(o, nv.data(), c); o[c] = 0; break; }
+            case ColPath: d.ParentPathInto(i, o, cap); break;
+            case ColSize: if (d.entries[i].IsDir()) o[0] = 0; else FormatSizeInto(d.entries[i].size, o, cap); break;
+            case ColDate: FormatTimeInto(d.entries[i].mtime, o, cap); break;
             }
         }
-        if (di->item.mask & LVIF_IMAGE) di->item.iImage = IconFor(i);
-        *out = 0;
         return true;
     }
-    case LVN_ODFINDITEMW: {
-        // 键入跳转：按名称前缀查找
+    case LVN_ODFINDITEMW: {   // 键入跳转：名称前缀（折叠比较）
         auto* fi = reinterpret_cast<NMLVFINDITEMW*>(nm);
         *out = -1;
-        if (!res_ || !(fi->lvfi.flags & (LVFI_STRING | LVFI_PARTIAL))) return true;
-        std::wstring pre = ToLower(fi->lvfi.psz);
+        if (!res_ || !(fi->lvfi.flags & (LVFI_STRING | LVFI_PARTIAL)) || res_->items.empty()) return true;
+        std::wstring_view pre(fi->lvfi.psz);
         size_t n = res_->items.size();
         for (size_t k = 0; k < n; ++k) {
             size_t row = (static_cast<size_t>(std::max(fi->iStart, 0)) + k) % n;
-            if (res_->data->LowerName(res_->items[row]).starts_with(pre)) { *out = static_cast<LRESULT>(row); break; }
+            auto nm2 = res_->data->Name(res_->items[row]);
+            if (nm2.size() >= pre.size() && CompareFold(nm2.substr(0, pre.size()), pre) == 0) { *out = static_cast<LRESULT>(row); break; }
         }
         return true;
     }
-    case NM_CUSTOMDRAW:
-        *out = CustomDraw(reinterpret_cast<NMLVCUSTOMDRAW*>(nm));
-        return true;
     }
     return false;
 }

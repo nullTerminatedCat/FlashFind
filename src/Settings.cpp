@@ -57,6 +57,7 @@ void Settings::Load() {
     toggleKey = ReadStr(ini, L"hotkey", L"toggle_window_key", toggleKey);
     doubleCtrl = ReadInt(ini, L"hotkey", L"toggle_window_double_ctrl", 1) != 0;
     theme = static_cast<ThemeMode>(ReadInt(ini, L"ui", L"theme", 0));
+    compressDb = ReadInt(ini, L"index", L"compress_db", 0) != 0;
     indexRoots = Split(ReadStr(ini, L"index", L"roots", L""));
     auto ex = ReadStr(ini, L"index", L"exclude_folders", L"\x01");
     if (ex != L"\x01") excludeFolders = Split(ex);
@@ -75,6 +76,7 @@ void Settings::Save() const {
     WriteStr(ini, L"hotkey", L"toggle_window_key", toggleKey);
     WriteInt(ini, L"hotkey", L"toggle_window_double_ctrl", doubleCtrl);
     WriteInt(ini, L"ui", L"theme", static_cast<int>(theme));
+    WriteInt(ini, L"index", L"compress_db", compressDb);
     WriteStr(ini, L"index", L"roots", Join(indexRoots));
     WriteStr(ini, L"index", L"exclude_folders", Join(excludeFolders));
 }

@@ -1,7 +1,5 @@
 #include "MainWindow.h"
 #include "Dpi.h"
-#include "MftIndexer.h"
-#include "ServiceClient.h"
 #include "Settings.h"
 #include "Theme.h"
 #include "Util.h"
@@ -81,8 +79,7 @@ void MainWindow::OnCreate() {
     }
     if (s.doubleCtrl) hotkeys_.EnableDoubleCtrl(hwnd_);
 
-    StartIndex();
-    RunSearch();
+    StartIndex(false);
 }
 
 void MainWindow::BuildMenu() {
@@ -120,12 +117,7 @@ void MainWindow::UpdateFonts() {
     lf.lfWeight = FW_BOLD;
     bold_ = CreateFontIndirectW(&lf);
     SendMessageW(edit_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
-    list_.SetFont(font_, bold_);
-    // 行高：通过假图像列表撑高（ListView 没有直接设置行高的 API）
-    static HIMAGELIST rowHeight = nullptr;
-    if (rowHeight) ImageList_Destroy(rowHeight);
-    rowHeight = ImageList_Create(1, Scale(26, dpi), ILC_COLOR, 1, 0);
-    ListView_SetImageList(list_.Hwnd(), rowHeight, LVSIL_STATE);
+    list_.SetFont(font_, bold_, Scale(26, dpi));
     Layout();
 }
 
@@ -208,24 +200,27 @@ void MainWindow::Paint() {
     EndPaint(hwnd_, &ps);
 }
 
-void MainWindow::StartIndex() {
+void MainWindow::StartIndex(bool force) {
     auto& s = GetSettings();
-    auto roots = s.indexRoots.empty() ? Indexer::DefaultRoots() : s.indexRoots;
-    // TODO(M3): ServiceClient 连上服务时改用服务端 MFT 索引，不再本地遍历
-    ServiceClient svc;
-    (void)svc.Connect();
-    (void)MftIndexer::Available();
-    indexProgress_ = 0;
-    indexer_.Start(hwnd_, roots, s.excludeFolders);
+    Indexer::Options o;
+    o.roots = s.indexRoots.empty() ? Indexer::DefaultRoots() : s.indexRoots;
+    o.excludes = s.excludeFolders;
+    o.dbPath = Indexer::DefaultDbPath();
+    o.compress = s.compressDb;
+    o.forceRebuild = force;
+    // TODO(服务): 需要特权的 MFT/USN 将来交给服务进程；目前当前进程已提升时直接读取
+    indexer_.Start(hwnd_, std::move(o));
     UpdateStatus();
 }
 
 void MainWindow::RunSearch() {
+    UpdateTitle();
+    auto snap = indexer_.Snapshot();
+    if (!snap) return;   // 索引未就绪：丢弃本次刷新，就绪后 WM_APP_INDEX_DONE 会重新搜索
     int len = GetWindowTextLengthW(edit_);
     std::wstring q(static_cast<size_t>(len), L'\0');
     if (len) GetWindowTextW(edit_, q.data(), len + 1);
-    searcher_->Request(q, indexer_.Snapshot());
-    UpdateTitle();
+    searcher_->Request(q, std::move(snap));
 }
 
 void MainWindow::UpdateTitle() {
@@ -238,13 +233,9 @@ void MainWindow::UpdateTitle() {
 
 void MainWindow::UpdateStatus() {
     std::wstring s;
-    if (indexer_.Busy()) {
-        s = L"正在建立索引… 已发现 " + WithThousands(indexProgress_) + L" 个对象";
-        auto cur = indexer_.CurrentFolder();
-        if (!cur.empty()) s += L"  ·  " + cur;
-    } else if (auto r = list_.Results()) {
+    auto r = list_.Results();
+    if (r && r->data) {
         s = WithThousands(r->items.size()) + L" 个对象";
-        if (r->data) s += L"（索引共 " + WithThousands(r->data->entries.size()) + L"）";
         int sel = list_.SelectedCount();
         if (sel > 0) {
             unsigned long long total = 0;
@@ -253,6 +244,19 @@ void MainWindow::UpdateStatus() {
         }
         wchar_t ms[48]; swprintf_s(ms, L"  ·  %.0f ms", lastSearchMs_);
         s += ms;
+    }
+    std::wstring phase;
+    switch (indexer_.Phase()) {
+    case IndexPhase::Loading: phase = L"正在加载数据库…"; break;
+    case IndexPhase::Creating: phase = L"正在创建数据库… 已扫描 " + WithThousands(indexer_.Progress()) + L" 个文件夹"; break;
+    case IndexPhase::Updating: phase = L"正在后台更新索引… " + WithThousands(indexer_.Progress()); break;
+    case IndexPhase::Saving: phase = L"正在保存数据库…"; break;
+    default: break;
+    }
+    if (!phase.empty()) {
+        auto cur = indexer_.CurrentFolder();
+        if (!cur.empty() && indexer_.Phase() != IndexPhase::Saving) phase += L"  " + cur;
+        s = s.empty() ? phase : s + L"  ·  " + phase;
     }
     statusLeft_ = s;
     InvalidateRect(hwnd_, &statusRc_, FALSE);
@@ -402,7 +406,7 @@ bool MainWindow::PreTranslate(MSG& msg) {
         return true;
     }
     if ((ctrl && k == 'F') || k == VK_F3 || (alt && k == 'D')) { SetFocus(edit_); SendMessageW(edit_, EM_SETSEL, 0, -1); return true; }
-    if (k == VK_F5) { StartIndex(); return true; }
+    if (k == VK_F5) { StartIndex(true); return true; }
     if (ctrl && k == 'Q') { DestroyWindow(hwnd_); return true; }
     if (ctrl && k == 'W') { HideToTray(); return true; }
 
@@ -452,8 +456,7 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
     case WM_DPICHANGED: {
         auto* r = reinterpret_cast<RECT*>(l);
         SetWindowPos(hwnd_, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
-        UINT oldDpi = 0; (void)oldDpi;
-        UpdateFonts();
+            UpdateFonts();
         return 0;
     }
     case WM_SETTINGCHANGE:
@@ -478,7 +481,7 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         }
         switch (id) {
         case IDM_EXIT: DestroyWindow(hwnd_); break;
-        case IDM_REINDEX: StartIndex(); break;
+        case IDM_REINDEX: StartIndex(true); break;
         case IDM_THEME_SYSTEM: case IDM_THEME_LIGHT: case IDM_THEME_DARK:
             GetSettings().theme = static_cast<ThemeMode>(id - IDM_THEME_SYSTEM); ApplyTheme(); break;
         case IDM_DOUBLE_CTRL:
@@ -532,7 +535,7 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     }
-    case WM_APP_INDEX_PROGRESS: indexProgress_ = static_cast<size_t>(w); UpdateStatus(); return 0;
+    case WM_APP_INDEX_PROGRESS: UpdateStatus(); return 0;
     case WM_APP_INDEX_DONE: RunSearch(); UpdateStatus(); return 0;
     case WM_CLOSE:
         if (GetSettings().closeToTray) { HideToTray(); return 0; }

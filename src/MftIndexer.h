@@ -1,19 +1,17 @@
 #pragma once
-// TODO(M3): NTFS MFT + USN Journal 索引器，运行在服务进程中（需要管理员 / LocalSystem）。
-// 计划：
-//  1. CreateFileW(L"\\\\.\\C:") 打开卷句柄
-//  2. FSCTL_QUERY_USN_JOURNAL（不存在时 FSCTL_CREATE_USN_JOURNAL）
-//  3. FSCTL_ENUM_USN_DATA 枚举全部 MFT 记录 -> (FRN, 父 FRN, 名称, 属性)
-//  4. 大小/时间：FSCTL_GET_NTFS_FILE_RECORD 或延迟按需 GetFileInformationByHandleEx
-//  5. FSCTL_READ_USN_JOURNAL 持续监听增量（创建/删除/重命名）
-//  6. 数据库持久化：%ProgramData%\FlashFind\FlashFind.db（压缩，带卷 USN 检查点）
-#include <string>
-#include <vector>
+// NTFS：MFT 枚举（FSCTL_ENUM_USN_DATA）+ 文件记录解析（FSCTL_GET_NTFS_FILE_RECORD，取大小/修改时间）
+// + USN Journal 增量（FSCTL_QUERY_USN_JOURNAL / FSCTL_READ_USN_JOURNAL）。
+// 需要打开卷句柄 \\.\C:，即管理员权限（M3 改由服务进程执行）。
+#include "Index.h"
 
 namespace ff {
 class MftIndexer {
 public:
-    static bool Available();                 // 当前进程是否有权限读取卷（M1 恒为 false）
-    static std::vector<std::wstring> NtfsVolumes();
+    static bool IsElevated();
+    static bool IsNtfs(const std::wstring& root, uint32_t* serial);
+    // 全量：成功返回 true，并填好 v.entries/names/frn、journalId、nextUsn
+    static bool Build(VolumeData& v, std::atomic<bool>& stop, std::atomic<size_t>& progress, std::wstring& err);
+    // 增量：从 v.info.nextUsn 读到当前；journal 不符或已被截断返回 false（调用方标记过期）
+    static bool ApplyUsn(VolumeData& v, std::atomic<bool>& stop, size_t* changes, std::wstring& err);
 };
 }

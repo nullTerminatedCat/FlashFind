@@ -20,6 +20,7 @@ struct Settings {
     bool doubleCtrl = true;
     // 外观
     ThemeMode theme = ThemeMode::System;
+    bool compressDb = false;   // 数据库是否 XPRESS_HUFF 压缩
     // 索引：空 = 所有固定磁盘
     std::vector<std::wstring> indexRoots;
     std::vector<std::wstring> excludeFolders = {L"C:\\Windows\\WinSxS", L"C:\\$Recycle.Bin", L"C:\\System Volume Information"};

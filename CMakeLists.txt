@@ -12,6 +12,9 @@ add_executable(FlashFind WIN32
     src/MainWindow.cpp src/MainWindow.h
     src/ResultList.cpp src/ResultList.h
     src/Index.cpp src/Index.h
+    src/Db.cpp src/Db.h
+    src/Fold.cpp src/Fold.h
+    src/Log.cpp src/Log.h
     src/Search.cpp src/Search.h
     src/Settings.cpp src/Settings.h
     src/Theme.cpp src/Theme.h
@@ -30,4 +33,4 @@ if(MSVC)
     target_compile_options(FlashFind PRIVATE /utf-8 /W4 /permissive- /MP)
     target_link_options(FlashFind PRIVATE /MANIFEST:NO)  # 使用 rc 内嵌的 app.manifest
 endif()
-target_link_libraries(FlashFind PRIVATE comctl32 uxtheme dwmapi shell32 shlwapi ole32 d2d1 dwrite)
+target_link_libraries(FlashFind PRIVATE comctl32 uxtheme dwmapi shell32 shlwapi ole32 d2d1 dwrite cabinet psapi)

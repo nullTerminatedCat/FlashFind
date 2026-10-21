@@ -24,7 +24,7 @@ private:
     void ApplyTheme();
     void Paint();
     void BuildMenu();
-    void StartIndex();
+    void StartIndex(bool force);
     void RunSearch();
     void UpdateStatus();
     void UpdateTitle();
@@ -49,7 +49,6 @@ private:
     bool hotkeyFailed_ = false;
     HFONT font_ = nullptr, bold_ = nullptr;
     RECT searchRc_{}, statusRc_{};
-    size_t indexProgress_ = 0;
     std::wstring statusLeft_;
     double lastSearchMs_ = 0;
     UINT taskbarCreated_ = 0;
