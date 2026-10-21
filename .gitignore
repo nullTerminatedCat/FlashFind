@@ -2,3 +2,4 @@ build/
 out/
 .vs/
 *.user
+hs_err_pid*.log

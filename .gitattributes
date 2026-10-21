@@ -1,0 +1,6 @@
+* text=auto
+*.cpp text diff=cpp
+*.h text diff=cpp
+*.md text
+*.png binary
+*.ico binary

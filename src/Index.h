@@ -34,9 +34,9 @@ struct VolumeInfo {
     std::wstring root;         // "C:"
     uint32_t serial = 0;
     bool ntfs = false;
-    bool mft = false;          // 由 MFT 枚举建立（有 FRN，可做 USN 增量）
-    uint64_t journalId = 0;
-    int64_t nextUsn = 0;
+    bool mft = false;          // 条目带完整 64 位 FRN（MFT 建立或带 FileId 的枚举），可做 USN 增量
+    uint64_t journalId = 0;    // 0 = 未跟踪
+    int64_t nextUsn = 0;       // 已应用到的 USN 游标
 };
 
 // 不可变快照
@@ -47,6 +47,7 @@ struct IndexData {
     std::vector<uint64_t> frn;        // 与 entries 等长或为空（无 MFT 卷时）
     std::vector<VolumeInfo> volumes;
     uint64_t configHash = 0;
+    uint32_t dbVersion = 0;
     size_t folders = 0, files = 0;
 
     std::wstring_view Name(uint32_t i) const { auto& e = entries[i]; return {names.data() + e.nameOff, e.nameLen}; }
@@ -70,7 +71,7 @@ struct VolumeData {
 
 std::shared_ptr<IndexData> Merge(std::vector<VolumeData>& vols, uint64_t configHash);
 VolumeData ExtractVolume(const IndexData& d, uint32_t vol);
-uint64_t ConfigHash(const std::vector<std::wstring>& roots, const std::vector<std::wstring>& excludes);
+uint64_t ConfigHash(const std::vector<std::wstring>& roots, const std::vector<std::wstring>& excludes, uint32_t version);
 
 enum class IndexPhase { Idle, Loading, Creating, Updating, Saving };
 
@@ -78,7 +79,9 @@ struct IndexStats {
     double loadSec = -1, rebuildSec = -1, updateSec = -1, saveSec = -1, sortSec = -1;
     uint64_t dbBytes = 0;
     bool loadedFromDb = false;
-    std::wstring note;   // 例如 “未提升权限，卷 C: 标记为过期，回退到文件夹遍历”
+    std::wstring note;          // 需要提示用户的信息（例如需要管理员/服务）
+    size_t usnChanges = 0, usnUnresolved = 0;
+    bool headerOnlyUpdate = false, fullSave = false;
 };
 
 class Indexer {
@@ -87,8 +90,11 @@ public:
         std::vector<std::wstring> roots, excludes;
         std::wstring dbPath;
         bool compress = false;
-        bool updateAfterLoad = true;   // 加载后是否更新过期卷（自检测加载速度时关掉）
-        bool forceRebuild = false;
+        bool updateAfterLoad = true;   // 加载后是否读 USN 增量（自检测加载速度时关掉）
+        bool forceRebuild = false;     // 强制重建（NTFS 卷需管理员读 MFT）
+        bool monitor = true;           // 启动后持续读 USN（ntfs_volume_monitors）
+        bool enableUsnJournal = true;  // Journal 未启用时尝试创建
+        std::vector<std::wstring> seedTraverse;  // 仅自检：允许以带 FileId 的枚举建立这些卷（用于中完整性测试 USN 路径）
     };
     // notifyHwnd 收 WM_APP_INDEX_PROGRESS / WM_APP_INDEX_DONE（每次发布新快照）
     void Start(HWND notifyHwnd, Options opt);
@@ -110,8 +116,9 @@ public:
 private:
     void Run(HWND hwnd, Options opt);
     void Publish(HWND hwnd, std::shared_ptr<IndexData> d);
-    bool BuildVolume(VolumeData& v, const std::vector<std::wstring>& excludes, std::wstring& note);
-    void Traverse(VolumeData& v, const std::vector<std::wstring>& excludes);
+    bool BuildVolume(VolumeData& v, const Options& opt, std::wstring& note);
+    // 读各卷 USN 增量并应用；返回是否有记录变化。cursorMoved 表示游标前进（需要至少更新头部）
+    bool PollUsn(std::shared_ptr<IndexData>& cur, const Options& opt, bool& cursorMoved, std::vector<uint32_t>* staleVols);
 
     std::thread thread_;
     std::atomic<bool> stop_{false}, busy_{false}, ready_{false};
@@ -121,6 +128,9 @@ private:
     std::shared_ptr<const IndexData> data_;
     std::wstring current_;
     IndexStats stats_;
+    std::vector<VolumeInfo> volState_;   // 索引线程独占：各卷当前游标
+    std::vector<uint8_t> stale_;
+    std::wstring adminVols_;
     HWND hwnd_ = nullptr;
 };
 

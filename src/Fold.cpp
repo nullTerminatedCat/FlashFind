@@ -2,6 +2,7 @@
 
 namespace ff {
 uint16_t g_fold[65536];
+bool g_fastAscii = true;
 
 void InitFold() {
     static bool done = false;

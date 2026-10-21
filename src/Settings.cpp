@@ -58,6 +58,10 @@ void Settings::Load() {
     doubleCtrl = ReadInt(ini, L"hotkey", L"toggle_window_double_ctrl", 1) != 0;
     theme = static_cast<ThemeMode>(ReadInt(ini, L"ui", L"theme", 0));
     compressDb = ReadInt(ini, L"index", L"compress_db", 0) != 0;
+    ntfsVolumeMonitors = ReadInt(ini, L"index", L"ntfs_volume_monitors", 1) != 0;
+    ntfsLoadRecentChanges = ReadInt(ini, L"index", L"ntfs_volume_load_recent_changes", 0) != 0;
+    ntfsEnableUsnJournal = ReadInt(ini, L"index", L"ntfs_enable_usn_journal", 1) != 0;
+    fastAsciiSearch = ReadInt(ini, L"search", L"fast_ascii_search", 1) != 0;
     indexRoots = Split(ReadStr(ini, L"index", L"roots", L""));
     auto ex = ReadStr(ini, L"index", L"exclude_folders", L"\x01");
     if (ex != L"\x01") excludeFolders = Split(ex);
@@ -77,6 +81,10 @@ void Settings::Save() const {
     WriteInt(ini, L"hotkey", L"toggle_window_double_ctrl", doubleCtrl);
     WriteInt(ini, L"ui", L"theme", static_cast<int>(theme));
     WriteInt(ini, L"index", L"compress_db", compressDb);
+    WriteInt(ini, L"index", L"ntfs_volume_monitors", ntfsVolumeMonitors);
+    WriteInt(ini, L"index", L"ntfs_volume_load_recent_changes", ntfsLoadRecentChanges);
+    WriteInt(ini, L"index", L"ntfs_enable_usn_journal", ntfsEnableUsnJournal);
+    WriteInt(ini, L"search", L"fast_ascii_search", fastAsciiSearch);
     WriteStr(ini, L"index", L"roots", Join(indexRoots));
     WriteStr(ini, L"index", L"exclude_folders", Join(excludeFolders));
 }

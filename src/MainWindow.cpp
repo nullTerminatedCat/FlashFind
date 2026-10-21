@@ -1,3 +1,4 @@
+#include "Fold.h"
 #include "MainWindow.h"
 #include "Dpi.h"
 #include "Settings.h"
@@ -208,7 +209,11 @@ void MainWindow::StartIndex(bool force) {
     o.dbPath = Indexer::DefaultDbPath();
     o.compress = s.compressDb;
     o.forceRebuild = force;
-    // TODO(服务): 需要特权的 MFT/USN 将来交给服务进程；目前当前进程已提升时直接读取
+    o.monitor = s.ntfsVolumeMonitors;
+    o.enableUsnJournal = s.ntfsEnableUsnJournal;
+    g_fastAscii = s.fastAsciiSearch;
+    noteShown_ = false;
+    // TODO(服务): 需要特权的 MFT 读取将来交给服务进程；目前当前进程已提升时直接读取
     indexer_.Start(hwnd_, std::move(o));
     UpdateStatus();
 }
@@ -248,7 +253,7 @@ void MainWindow::UpdateStatus() {
     std::wstring phase;
     switch (indexer_.Phase()) {
     case IndexPhase::Loading: phase = L"正在加载数据库…"; break;
-    case IndexPhase::Creating: phase = L"正在创建数据库… 已扫描 " + WithThousands(indexer_.Progress()) + L" 个文件夹"; break;
+    case IndexPhase::Creating: phase = L"正在创建数据库… " + WithThousands(indexer_.Progress()); break;
     case IndexPhase::Updating: phase = L"正在后台更新索引… " + WithThousands(indexer_.Progress()); break;
     case IndexPhase::Saving: phase = L"正在保存数据库…"; break;
     default: break;
@@ -257,6 +262,13 @@ void MainWindow::UpdateStatus() {
         auto cur = indexer_.CurrentFolder();
         if (!cur.empty() && indexer_.Phase() != IndexPhase::Saving) phase += L"  " + cur;
         s = s.empty() ? phase : s + L"  ·  " + phase;
+    }
+    if (indexer_.Phase() == IndexPhase::Idle) {
+        auto note = indexer_.Stats().note;
+        if (!note.empty()) {
+            s = s.empty() ? L"⚠ " + note : s + L"  ·  ⚠ " + note;
+            if (!noteShown_) { noteShown_ = true; tray_.ShowBalloon(L"闪寻：部分 NTFS 卷未能更新", note.c_str()); }
+        }
     }
     statusLeft_ = s;
     InvalidateRect(hwnd_, &statusRc_, FALSE);

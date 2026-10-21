@@ -45,6 +45,7 @@ private:
     Indexer indexer_;
     std::unique_ptr<Searcher> searcher_;
     Tray tray_;
+    bool noteShown_ = false;
     HotkeyManager hotkeys_;
     bool hotkeyFailed_ = false;
     HFONT font_ = nullptr, bold_ = nullptr;

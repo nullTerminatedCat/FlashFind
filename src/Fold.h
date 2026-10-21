@@ -28,6 +28,29 @@ inline bool ContainsFold(std::wstring_view s, std::wstring_view term) {
     return false;
 }
 
+// ASCII 快速路径（fast_ascii_search=1）：term 全为 ASCII 时，ASCII 字符用寄存器内运算折叠，
+// 只有非 ASCII 字符才查 64K 表（保持与 Fold 完全一致的结果，例如 U+212A 开尔文符号仍折叠为 k）。
+extern bool g_fastAscii;
+inline bool IsAscii(std::wstring_view s) { for (wchar_t c : s) if (c >= 128) return false; return true; }
+inline wchar_t FoldA(wchar_t c) {
+    if (c < 128) return static_cast<wchar_t>(c - L'A' < 26u ? c | 0x20 : c);
+    return Fold(c);
+}
+inline bool ContainsFoldAscii(std::wstring_view s, std::wstring_view term) {
+    const size_t m = term.size(), n = s.size();
+    if (m == 0) return true;
+    if (m > n) return false;
+    const wchar_t t0 = term[0];
+    const wchar_t* p = s.data();
+    for (size_t i = 0, last = n - m; i <= last; ++i) {
+        if (FoldA(p[i]) != t0) continue;
+        size_t k = 1;
+        while (k < m && FoldA(p[i + k]) == term[k]) ++k;
+        if (k == m) return true;
+    }
+    return false;
+}
+
 // 返回下一个匹配位置（npos 表示无）
 inline size_t FindFold(std::wstring_view s, std::wstring_view term, size_t from) {
     const size_t m = term.size(), n = s.size();

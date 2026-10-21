@@ -29,6 +29,12 @@ bool SearchCore(const IndexData& d, const std::vector<std::wstring>& terms, std:
     if (n < 100000) nt = 1;
     std::vector<std::vector<uint32_t>> parts(nt);
     std::atomic<bool> stop{false};
+    std::vector<uint8_t> slash(terms.size()), ascii(terms.size());
+    for (size_t j = 0; j < terms.size(); ++j) {
+        slash[j] = terms[j].find(L'\\') != std::wstring::npos;
+        ascii[j] = g_fastAscii && IsAscii(terms[j]);
+    }
+    auto match = [&](std::wstring_view s, size_t j) { return ascii[j] ? ContainsFoldAscii(s, terms[j]) : ContainsFold(s, terms[j]); };
     auto work = [&](unsigned t) {
         size_t b = n * t / nt, e = n * (t + 1) / nt;
         auto& o = parts[t];
@@ -38,11 +44,11 @@ bool SearchCore(const IndexData& d, const std::vector<std::wstring>& terms, std:
             uint32_t i = order[k];
             auto name = d.Name(i);
             bool ok = true; size_t flen = SIZE_MAX;
-            for (auto& term : terms) {
-                if (term.find(L'\\') != std::wstring::npos) {    // 含 \ 匹配完整路径
+            for (size_t j = 0; j < terms.size(); ++j) {
+                if (slash[j]) {    // 含 \ 匹配完整路径
                     if (flen == SIZE_MAX) { if (full.empty()) full.resize(32768); flen = d.FullPathInto(i, full.data(), full.size()); }
-                    if (!ContainsFold({full.data(), flen}, term)) { ok = false; break; }
-                } else if (!ContainsFold(name, term)) { ok = false; break; }
+                    if (!match({full.data(), flen}, j)) { ok = false; break; }
+                } else if (!match(name, j)) { ok = false; break; }
             }
             if (ok) o.push_back(i);
         }
