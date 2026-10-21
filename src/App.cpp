@@ -86,7 +86,7 @@ static int IncrTest(std::wstring dbPath) {
     if (dbPath.empty()) dbPath = Indexer::DefaultDbPath();
     std::wstring err;
     double t0 = NowMs();
-    std::shared_ptr<IndexData> cur = LoadDb(dbPath, err);
+    std::shared_ptr<IndexData> cur = LoadDbCopy(dbPath, err);
     double loadMs = NowMs() - t0;
     if (!cur) { out += L"[load] 数据库不可用（" + err + L"），改用合成索引\r\n"; t0 = NowMs(); cur = Synthesize(2260000); loadMs = NowMs() - t0; }
     const size_t n = cur->entries.size();
@@ -494,7 +494,7 @@ static int WildTest(std::wstring dbPath) {
     T(L"C:\\Windows\\notepad.exe", L"c:\\windows\\*.exe", true); T(L"C:\\Windows\\System32\\a.exe", L"c:\\windows\\?.exe", false);
     InitFold(); g_fastAscii = true;
     std::wstring err; if (dbPath.empty()) dbPath = Indexer::DefaultDbPath();
-    auto d = LoadDb(dbPath, err);
+    auto d = LoadDbCopy(dbPath, err);
     if (!d) { out += L"[db] 无数据库，改用合成索引\r\n"; d = Synthesize(2260000); }
     swprintf_s(buf, L"[db] %zu 个对象，%u 线程\r\n", d->entries.size(), std::max(1u, std::min(std::thread::hardware_concurrency(), 16u))); out += buf;
     for (const wchar_t* q : {L"exe", L".exe", L"1*.exe", L"*.exe", L"*.EXE", L"a?c", L"**", L"*a*e*.?x?", L"report *.docx", L"win*\\*.dll"}) {
@@ -515,7 +515,7 @@ static int WildTest(std::wstring dbPath) {
 static int SortTest(std::wstring dbPath) {
     std::wstring out; wchar_t buf[1024]; int fails = 0;
     std::wstring err; if (dbPath.empty()) dbPath = Indexer::DefaultDbPath();
-    auto d = LoadDb(dbPath, err);
+    auto d = LoadDbCopy(dbPath, err);
     if (!d) { out += L"[db] 无数据库，改用合成索引\r\n"; d = Synthesize(2260000); }
     for (size_t i = 0; i < d->entries.size(); i += 7) d->entries.Mut(i).mtime = 133000000000000000ULL + (i * 2654435761ULL) % 100000000000ULL;   // 合成库时间全 0：打散
     swprintf_s(buf, L"[db] %zu 个对象\r\n", d->entries.size()); out += buf;
@@ -605,7 +605,7 @@ static int SyntaxTest(std::wstring dbPath) {
     T(L"size:abc", L"");
     InitFold(); g_fastAscii = true;
     std::wstring err; if (dbPath.empty()) dbPath = Indexer::DefaultDbPath();
-    auto big = LoadDb(dbPath, err);
+    auto big = LoadDbCopy(dbPath, err);
     if (!big) { out += L"[db] 无数据库，改用合成索引\r\n"; big = Synthesize(2260000); }
     swprintf_s(buf, L"[db] %zu 个对象\r\n", big->entries.size()); out += buf;
     for (const wchar_t* q : {L"exe", L"exe|dll", L"ext:exe", L"ext:exe;dll;sys", L"!exe", L"size:>100mb", L"dm:thisweek", L"file: dm:today",
@@ -625,7 +625,7 @@ static int IconTest(std::wstring dbPath) {
     std::wstring out; wchar_t buf[512];
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     std::wstring err; if (dbPath.empty()) dbPath = Indexer::DefaultDbPath();
-    auto d = LoadDb(dbPath, err);
+    auto d = LoadDbCopy(dbPath, err);
     if (!d) { WriteOut(L"ff_icontest.txt", L"[skip] 无数据库\r\n"); return 0; }
     std::vector<std::wstring> paths;
     for (uint32_t i : d->byName) { auto n = d->Name(i); if (n.size() > 4 && CompareFold(n.substr(n.size() - 4), L".exe") == 0) { paths.push_back(d->FullPath(i)); if (paths.size() >= 200) break; } }

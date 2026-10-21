@@ -7,6 +7,38 @@
 
 namespace ff {
 
+DbLock::DbLock(const std::wstring& dbPath, bool exclusive, DWORD timeoutMs) {
+    HANDLE h = CreateFileW((dbPath + L".lock").c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+    if (h == INVALID_HANDLE_VALUE) h = CreateFileW((dbPath + L".lock").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                                   nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    h_ = h;
+    const ULONGLONG end = GetTickCount64() + timeoutMs;
+    for (;;) {
+        OVERLAPPED ov{};
+        if (LockFileEx(h, (exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0) | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov)) { held_ = true; return; }
+        if (GetTickCount64() >= end) { Log(L"数据库锁超时（%s）", exclusive ? L"排他" : L"共享"); return; }
+        Sleep(20);
+    }
+}
+DbLock::~DbLock() {
+    if (!h_) return;
+    if (held_) { OVERLAPPED ov{}; UnlockFileEx(h_, 0, 1, 0, &ov); }
+    CloseHandle(h_);
+}
+
+std::shared_ptr<IndexData> LoadDbCopy(const std::wstring& path, std::wstring& err) {
+    wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
+    std::wstring copy = std::wstring(tmp) + L"ff_dbcopy_" + std::to_wstring(GetCurrentProcessId()) + L".db";
+    BOOL ok;
+    { DbLock lk(path, false); ok = CopyFileW(path.c_str(), copy.c_str(), FALSE); }
+    if (!ok) { err = L"数据库不存在"; return nullptr; }
+    auto d = LoadDb(copy, err);
+    DeleteFileW(copy.c_str());
+    return d;
+}
+
 #pragma pack(push, 1)
 struct DbHeader {           // v2 / v3 共用的前 48 字节
     char magic[4];          // "FFDB"
@@ -89,6 +121,7 @@ static bool ParseVolTable(const uint8_t* p, size_t n, std::vector<VolumeInfo>& o
 }
 
 bool UpdateDbVolumes(const std::wstring& path, const std::vector<VolumeInfo>& vols) {
+    DbLock lk(path, true);
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;
     DbHeader h{}; DWORD rd = 0;
@@ -141,6 +174,7 @@ bool SaveDb(const std::wstring& path, const IndexData& d, bool compress, uint64_
     h.checksum = Checksum(payload->data(), payload->size());
 
     std::wstring tmp = path + L".tmp";
+    DbLock lk(path, true);   // 仅包住 写 .tmp + 重命名；序列化/压缩在锁外完成
     HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (f == INVALID_HANDLE_VALUE) { Log(L"保存数据库失败：无法创建 %s", tmp.c_str()); return false; }
     DWORD wr = 0; bool ok = WriteFile(f, &h, sizeof(h), &wr, nullptr) && WriteFile(f, vt.data(), static_cast<DWORD>(vt.size()), &wr, nullptr);
@@ -160,32 +194,35 @@ bool SaveDb(const std::wstring& path, const IndexData& d, bool compress, uint64_
 }
 
 std::shared_ptr<IndexData> LoadDb(const std::wstring& path, std::wstring& err) {
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    std::vector<uint8_t> stored; DbHeader h{}; std::vector<VolumeInfo> vols; bool v2 = false; bool ok = true;
+    {   // 共享锁只覆盖一次完整读取；之后解压/解析不持锁（文件不做内存映射）
+    DbLock lk(path, false);
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (f == INVALID_HANDLE_VALUE) { err = L"数据库不存在"; return nullptr; }
     LARGE_INTEGER sz{}; GetFileSizeEx(f, &sz);
-    DbHeader h{}; DWORD rd = 0;
+    DWORD rd = 0;
     if (sz.QuadPart < static_cast<LONGLONG>(sizeof(h)) || !ReadFile(f, &h, sizeof(h), &rd, nullptr) || rd != sizeof(h) ||
         memcmp(h.magic, "FFDB", 4) != 0) { CloseHandle(f); err = L"文件头损坏"; return nullptr; }
     if (h.version != kDbVersion && h.version != 2 && h.version != 3) { CloseHandle(f); err = L"版本不符"; return nullptr; }
-    const bool v2 = h.version == 2;
+    v2 = h.version == 2;
     if (v2) h.headerSize = sizeof(DbHeader);
     if (h.headerSize < sizeof(DbHeader) || h.headerSize > 1 << 16 ||
         h.storedSize != static_cast<uint64_t>(sz.QuadPart) - h.headerSize || h.rawSize > (8ULL << 30)) { CloseHandle(f); err = L"长度不符（损坏）"; return nullptr; }
-    std::vector<VolumeInfo> vols;
     if (!v2) {
         std::vector<uint8_t> vt(h.headerSize - sizeof(DbHeader));
         if (!ReadFile(f, vt.data(), static_cast<DWORD>(vt.size()), &rd, nullptr) || rd != vt.size() || !ParseVolTable(vt.data(), vt.size(), vols)) {
             CloseHandle(f); err = L"卷表损坏"; return nullptr;
         }
     }
-    std::vector<uint8_t> stored(static_cast<size_t>(h.storedSize));
-    bool ok = true;
+    stored.resize(static_cast<size_t>(h.storedSize));
+    ok = true;
     for (size_t off = 0; ok && off < stored.size(); off += rd) {
         DWORD chunk = static_cast<DWORD>(std::min<size_t>(stored.size() - off, 64u << 20));
         ok = ReadFile(f, stored.data() + off, chunk, &rd, nullptr) && rd == chunk;
     }
     CloseHandle(f);
     if (!ok) { err = L"读取失败"; return nullptr; }
+    }
     if (Checksum(stored.data(), stored.size()) != h.checksum) { err = L"校验和不符（损坏）"; return nullptr; }
 
     std::vector<uint8_t> raw;
