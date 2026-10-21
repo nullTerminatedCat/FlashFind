@@ -41,7 +41,7 @@ private:
     void ServiceAction(bool install);
     void SavePlacement();
 
-    HWND hwnd_ = nullptr, edit_ = nullptr, svcBtn_ = nullptr;
+    HWND hwnd_ = nullptr, edit_ = nullptr, svcBtn_ = nullptr, filter_ = nullptr;
     HBITMAP shieldBmp_ = nullptr;
     int svcBtnW_ = 0;
     ResultList list_;

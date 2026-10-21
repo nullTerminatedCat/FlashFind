@@ -8,6 +8,7 @@
 #include "Theme.h"
 #include "Util.h"
 #include <commctrl.h>
+#include <uxtheme.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <windowsx.h>
@@ -15,7 +16,7 @@
 namespace ff {
 
 enum : int {
-    IDC_SEARCH = 100, IDC_LIST,
+    IDC_SEARCH = 100, IDC_LIST, IDC_FILTER,
     IDM_EXIT = 1000, IDM_REINDEX, IDM_THEME_SYSTEM, IDM_THEME_LIGHT, IDM_THEME_DARK,
     IDM_ABOUT, IDM_SHOW, IDM_OPEN, IDM_OPEN_PATH, IDM_COPY_PATH, IDM_COPY_NAME, IDM_PROPERTIES,
     IDM_DOUBLE_CTRL,
@@ -23,6 +24,26 @@ enum : int {
     IDM_UNINSTALL_SVC,
     IDC_SVC_BTN,
 };
+
+// 过滤器（与 Everything 默认过滤器相同的扩展名表）
+struct FilterDef { const wchar_t* name; const wchar_t* expr; };
+static const FilterDef kFilters[] = {
+    {L"全部", L""},
+    {L"音频", L"ext:aac;ac3;aif;aifc;aiff;au;cda;dts;fla;flac;it;m1a;m2a;m3u;m4a;mid;midi;mka;mod;mp2;mp3;mpa;ogg;ra;rmi;spc;snd;umx;voc;wav;wma;xm"},
+    {L"压缩文件", L"ext:7z;ace;arj;bz2;cab;gz;gzip;jar;r00;r01;r02;r03;r04;r05;r06;r07;r08;r09;r10;r11;r12;r13;r14;r15;r16;r17;r18;r19;r20;r21;r22;r23;r24;r25;r26;r27;r28;r29;rar;tar;tgz;xz;z;zip;zst"},
+    {L"文档", L"ext:c;chm;cpp;csv;cxx;doc;docm;docx;dot;dotm;dotx;h;hpp;htm;html;hxx;ini;java;lua;md;mht;mhtml;odt;pdf;potx;potm;ppam;ppsm;ppsx;pps;ppt;pptm;pptx;rtf;sldm;sldx;thmx;txt;vsd;wpd;wps;wri;xlam;xls;xlsb;xlsm;xlsx;xltm;xltx;xml"},
+    {L"可执行文件", L"ext:bat;cmd;exe;msi;msp;scr"},
+    {L"文件夹", L"folder:"},
+    {L"图片", L"ext:ani;bmp;gif;heic;ico;jpe;jpeg;jpg;pcx;png;psd;svg;tga;tif;tiff;webp;wmf"},
+    {L"视频", L"ext:3g2;3gp;3gp2;3gpp;amr;amv;asf;avi;bdmv;bik;d2v;divx;drc;dsa;dsm;dss;dsv;evo;f4v;flc;fli;flic;flv;hdmov;ifo;ivf;m1v;m2p;m2t;m2ts;m2v;m4b;m4p;m4v;mkv;mp2v;mp4;mp4v;mpe;mpeg;mpg;mpls;mpv2;mpv4;mov;mts;ogm;ogv;pss;pva;qt;ram;ratdvd;rm;rmm;rmvb;roq;rpm;smil;smk;swf;tp;tpr;ts;vob;vp6;webm;wm;wmp;wmv"},
+};
+
+static std::wstring ApplyFilter(const std::wstring& q, int filter) {
+    if (filter <= 0 || filter >= static_cast<int>(std::size(kFilters))) return q;
+    std::wstring f = kFilters[filter].expr;
+    bool blank = q.find_first_not_of(L" \t") == std::wstring::npos;
+    return blank ? f : L"<" + q + L"> " + f;
+}
 
 bool MainWindow::Create(int show) {
     HINSTANCE inst = App::Instance();
@@ -72,6 +93,10 @@ void MainWindow::OnCreate() {
                             0, 0, 10, 10, hwnd_, reinterpret_cast<HMENU>(IDC_SEARCH), App::Instance(), nullptr);
     SendMessageW(edit_, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"输入文件名搜索…（空格分隔多个词，含 \\ 则匹配路径）"));
     list_.Create(hwnd_, IDC_LIST);
+    filter_ = CreateWindowExW(0, WC_COMBOBOXW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                              0, 0, 10, 300, hwnd_, reinterpret_cast<HMENU>(IDC_FILTER), App::Instance(), nullptr);
+    for (auto& f : kFilters) SendMessageW(filter_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(f.name));
+    SendMessageW(filter_, CB_SETCURSEL, std::clamp(GetSettings().filter, 0, static_cast<int>(std::size(kFilters)) - 1), 0);
     svcBtn_ = CreateWindowExW(0, WC_BUTTONW, L"安装 FlashFind 服务", WS_CHILD | BS_PUSHBUTTON,
                               0, 0, 10, 10, hwnd_, reinterpret_cast<HMENU>(IDC_SVC_BTN), App::Instance(), nullptr);
     SendMessageW(svcBtn_, BCM_SETSHIELD, 0, TRUE);
@@ -192,6 +217,7 @@ void MainWindow::ApplyTheme() {
     t.Resolve(GetSettings().theme);
     t.ApplyToWindow(hwnd_);
     list_.ApplyTheme();
+    if (filter_) SetWindowTheme(filter_, t.Dark() ? L"DarkMode_CFD" : L"CFD", nullptr);
     HMENU bar = GetMenu(hwnd_);
     int sel = IDM_THEME_SYSTEM + static_cast<int>(GetSettings().theme);
     CheckMenuRadioItem(bar, IDM_THEME_SYSTEM, IDM_THEME_DARK, sel, MF_BYCOMMAND);
@@ -208,6 +234,14 @@ void MainWindow::Layout() {
     int sh = Scale(34, dpi);
     int stH = Scale(28, dpi);
     searchRc_ = {rc.left + m, rc.top + m, rc.right - m, rc.top + m + sh};
+    if (filter_) {   // 过滤器下拉框在搜索框右侧
+        SendMessageW(filter_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
+        int fw = Scale(120, dpi);
+        searchRc_.right -= fw + m;
+        RECT cr{}; GetWindowRect(filter_, &cr);
+        int ch = cr.bottom - cr.top;
+        MoveWindow(filter_, searchRc_.right + m, searchRc_.top + (sh - ch) / 2, fw, Scale(320, dpi), TRUE);
+    }
     HDC dc = GetDC(hwnd_);
     HGDIOBJ o = SelectObject(dc, font_);
     TEXTMETRICW tm; GetTextMetricsW(dc, &tm);
@@ -303,7 +337,7 @@ void MainWindow::RunSearch() {
     int len = GetWindowTextLengthW(edit_);
     std::wstring q(static_cast<size_t>(len), L'\0');
     if (len) GetWindowTextW(edit_, q.data(), len + 1);
-    searcher_->Request(q, std::move(snap), list_.Sort());
+    searcher_->Request(ApplyFilter(q, filter_ ? static_cast<int>(SendMessageW(filter_, CB_GETCURSEL, 0, 0)) : 0), std::move(snap), list_.Sort());
 }
 
 void MainWindow::UpdateTitle() {
@@ -573,6 +607,10 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_COMMAND: {
         int id = LOWORD(w);
+        if (id == IDC_FILTER) {
+            if (HIWORD(w) == CBN_SELCHANGE) { GetSettings().filter = static_cast<int>(SendMessageW(filter_, CB_GETCURSEL, 0, 0)); RunSearch(); }
+            return 0;
+        }
         if (id == IDC_SEARCH) {
             if (HIWORD(w) == EN_CHANGE) RunSearch();
             if (HIWORD(w) == EN_SETFOCUS || HIWORD(w) == EN_KILLFOCUS) InvalidateRect(hwnd_, &searchRc_, FALSE);

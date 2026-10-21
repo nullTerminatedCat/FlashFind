@@ -600,10 +600,11 @@ static int SyntaxTest(std::wstring dbPath) {
     if (!big) { out += L"[db] 无数据库，改用合成索引\r\n"; big = Synthesize(2260000); }
     swprintf_s(buf, L"[db] %zu 个对象\r\n", big->entries.size()); out += buf;
     for (const wchar_t* q : {L"exe", L"exe|dll", L"ext:exe", L"ext:exe;dll;sys", L"!exe", L"size:>100mb", L"dm:thisweek", L"file: dm:today",
-                             L"report !<pdf|docx>", L"path:windows ext:dll", L"*.exe size:>1mb"}) {
+                             L"report !<pdf|docx>", L"path:windows ext:dll", L"*.exe size:>1mb",
+                             L"ext:ani;bmp;gif;heic;ico;jpe;jpeg;jpg;pcx;png;psd;svg;tga;tif;tiff;webp;wmf", L"<report> folder:"}) {
         auto cq = CompileQuery(q); std::vector<uint32_t> res; double best = 1e9;
         for (int k = 0; k < 5; ++k) { double a = NowMs(); SearchQuery(*big, *cq, res, [] { return false; }); best = std::min(best, NowMs() - a); }
-        swprintf_s(buf, L"[search] %-24s results=%-8zu best=%6.2f ms\r\n", q, res.size(), best); out += buf;
+        swprintf_s(buf, L"[search] %-.40s results=%-8zu best=%6.2f ms\r\n", q, res.size(), best); out += buf;
     }
     swprintf_s(buf, L"[result] %s (%d failed)\r\n", fails ? L"FAIL" : L"PASS", fails); out += buf;
     WriteOut(L"ff_syntaxtest.txt", out);
