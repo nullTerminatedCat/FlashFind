@@ -1,5 +1,8 @@
 #include "Fold.h"
 #include "MainWindow.h"
+#include "NtfsSource.h"
+#include <shellapi.h>
+#include <algorithm>
 #include "Dpi.h"
 #include "Settings.h"
 #include "Theme.h"
@@ -16,6 +19,9 @@ enum : int {
     IDM_EXIT = 1000, IDM_REINDEX, IDM_THEME_SYSTEM, IDM_THEME_LIGHT, IDM_THEME_DARK,
     IDM_ABOUT, IDM_SHOW, IDM_OPEN, IDM_OPEN_PATH, IDM_COPY_PATH, IDM_COPY_NAME, IDM_PROPERTIES,
     IDM_DOUBLE_CTRL,
+    IDM_INSTALL_SVC,
+    IDM_UNINSTALL_SVC,
+    IDC_SVC_BTN,
 };
 
 bool MainWindow::Create(int show) {
@@ -66,6 +72,9 @@ void MainWindow::OnCreate() {
                             0, 0, 10, 10, hwnd_, reinterpret_cast<HMENU>(IDC_SEARCH), App::Instance(), nullptr);
     SendMessageW(edit_, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"输入文件名搜索…（空格分隔多个词，含 \\ 则匹配路径）"));
     list_.Create(hwnd_, IDC_LIST);
+    svcBtn_ = CreateWindowExW(0, WC_BUTTONW, L"安装 FlashFind 服务", WS_CHILD | BS_PUSHBUTTON,
+                              0, 0, 10, 10, hwnd_, reinterpret_cast<HMENU>(IDC_SVC_BTN), App::Instance(), nullptr);
+    SendMessageW(svcBtn_, BCM_SETSHIELD, 0, TRUE);
     searcher_ = std::make_unique<Searcher>(hwnd_);
     BuildMenu();
     UpdateFonts();
@@ -83,6 +92,53 @@ void MainWindow::OnCreate() {
     StartIndex(false);
 }
 
+// UAC 盾牌：SHGetStockIconInfo(SIID_SHIELD) 小图标 -> 32bpp 预乘 alpha 位图（菜单用）
+static HBITMAP ShieldBitmap(UINT dpi) {
+    SHSTOCKICONINFO sii{sizeof(sii)};
+    if (FAILED(SHGetStockIconInfo(SIID_SHIELD, SHGSI_ICONLOCATION, &sii))) return nullptr;
+    int cx = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+    HICON ic = nullptr;
+    if (FAILED(LoadIconWithScaleDown(nullptr, IDI_SHIELD, cx, cx, &ic)) || !ic) {
+        if (FAILED(SHGetStockIconInfo(SIID_SHIELD, SHGSI_ICON | SHGSI_SMALLICON, &sii))) return nullptr;
+        ic = sii.hIcon;
+    }
+    BITMAPINFO bi{}; bi.bmiHeader = {sizeof(BITMAPINFOHEADER), cx, -cx, 1, 32, BI_RGB};
+    void* bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bmp) {
+        HGDIOBJ o = SelectObject(dc, bmp);
+        DrawIconEx(dc, 0, 0, ic, cx, cx, 0, nullptr, DI_NORMAL);
+        SelectObject(dc, o);
+    }
+    DeleteDC(dc); DestroyIcon(ic);
+    return bmp;
+}
+
+// 安装/卸载服务：以 runas 重新启动自身（UAC），等待，显示结果；成功后重新连接管道继续索引（无需重启）
+void MainWindow::ServiceAction(bool install) {
+    DWORD r = RunElevated(hwnd_, install ? L"-install-service" : L"-uninstall-service");
+    std::wstring msg;
+    if (r == 0) {
+        msg = install ? L"FlashFind 服务已安装并启动。闪寻将通过服务读取 NTFS 主文件表与 USN 日志，正在继续索引。"
+                      : L"FlashFind 服务已卸载。";
+        MessageBoxW(hwnd_, msg.c_str(), kAppName, MB_ICONINFORMATION);
+        noteShown_ = false;
+        StartIndex(false);   // 未提升的界面连接服务管道，继续索引
+        return;
+    }
+    if (r == ERROR_CANCELLED) msg = L"已取消：用户拒绝了 UAC 提权请求（ERROR_CANCELLED）。";
+    else {
+        wchar_t* t = nullptr;
+        FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, r, 0, reinterpret_cast<LPWSTR>(&t), 0, nullptr);
+        wchar_t b[96]; swprintf_s(b, L"失败，错误码 %lu", r);
+        msg = std::wstring(install ? L"安装" : L"卸载") + L" FlashFind 服务" + b + (t ? L"：" + std::wstring(t) : L"");
+        if (t) LocalFree(t);
+        msg += L"\n详情见 %ProgramData%\\FlashFind\\FlashFind-service.log";
+    }
+    MessageBoxW(hwnd_, msg.c_str(), kAppName, MB_ICONWARNING);
+}
+
 void MainWindow::BuildMenu() {
     HMENU bar = CreateMenu();
     HMENU file = CreatePopupMenu();
@@ -97,6 +153,15 @@ void MainWindow::BuildMenu() {
     AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(theme), L"主题(&T)");
     HMENU tools = CreatePopupMenu();
     AppendMenuW(tools, MF_STRING, IDM_DOUBLE_CTRL, L"双击 Ctrl 显示/隐藏");
+    AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(tools, MF_STRING, IDM_INSTALL_SVC, L"安装 FlashFind 服务(&I)…");
+    AppendMenuW(tools, MF_STRING, IDM_UNINSTALL_SVC, L"卸载 FlashFind 服务(&U)…");
+    if (!shieldBmp_) shieldBmp_ = ShieldBitmap(DpiOf(hwnd_));
+    if (shieldBmp_) {
+        MENUITEMINFOW mi{sizeof(mi)}; mi.fMask = MIIM_BITMAP; mi.hbmpItem = shieldBmp_;
+        SetMenuItemInfoW(tools, IDM_INSTALL_SVC, FALSE, &mi);
+        SetMenuItemInfoW(tools, IDM_UNINSTALL_SVC, FALSE, &mi);
+    }
     HMENU help = CreatePopupMenu();
     AppendMenuW(help, MF_STRING, IDM_ABOUT, L"关于闪寻(&A)…");
     AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"文件(&F)");
@@ -151,6 +216,13 @@ void MainWindow::Layout() {
     int eh = tm.tmHeight;
     MoveWindow(edit_, searchRc_.left + pad, searchRc_.top + (sh - eh) / 2, (searchRc_.right - searchRc_.left) - 2 * pad, eh, TRUE);
     statusRc_ = {rc.left, rc.bottom - stH, rc.right, rc.bottom};
+    if (svcBtn_) {
+        SendMessageW(svcBtn_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
+        SIZE bs{}; SendMessageW(svcBtn_, BCM_GETIDEALSIZE, 0, reinterpret_cast<LPARAM>(&bs));
+        int bw = std::max<int>(bs.cx, Scale(150, dpi)), bh = stH - Scale(4, dpi);
+        svcBtnW_ = bw + Scale(8, dpi);
+        MoveWindow(svcBtn_, statusRc_.right - Scale(4, dpi) - bw, statusRc_.top + Scale(2, dpi), bw, bh, TRUE);
+    }
     MoveWindow(list_.Hwnd(), rc.left + m, searchRc_.bottom + m, (rc.right - rc.left) - 2 * m,
                statusRc_.top - (searchRc_.bottom + m), TRUE);
     InvalidateRect(hwnd_, nullptr, TRUE);
@@ -181,6 +253,7 @@ void MainWindow::Paint() {
     SetBkMode(dc, TRANSPARENT);
     HGDIOBJ of = SelectObject(dc, font_);
     RECT tr = statusRc_; tr.left += Scale(12, dpi); tr.right -= Scale(12, dpi);
+    if (svcBtn_ && IsWindowVisible(svcBtn_)) tr.right -= svcBtnW_;
     // 指示点
     COLORREF dot = indexer_.Busy() ? RGB(0xE8, 0xA3, 0x17) : RGB(0x2F, 0xB3, 0x44);
     int ds = Scale(7, dpi), cy = (tr.top + tr.bottom) / 2;
@@ -272,10 +345,19 @@ void MainWindow::UpdateStatus() {
         auto note = indexer_.Stats().note;
         if (!note.empty()) {
             s = s.empty() ? L"⚠ " + note : s + L"  ·  ⚠ " + note;
-            if (!noteShown_) { noteShown_ = true; tray_.ShowBalloon(L"闪寻：部分 NTFS 卷未能更新", note.c_str()); }
+            if (!noteShown_) {
+                noteShown_ = true;
+                std::wstring b = note;
+                if (indexer_.Stats().needService) b += L"\n点击此通知安装 FlashFind 服务（需要管理员确认）。";
+                tray_.ShowBalloon(L"闪寻：部分 NTFS 卷未能更新", b.c_str());
+            }
         }
     }
     statusLeft_ = s;
+    {
+        bool need = indexer_.Phase() == IndexPhase::Idle && indexer_.Stats().needService;
+        if (svcBtn_ && (IsWindowVisible(svcBtn_) != FALSE) != need) ShowWindow(svcBtn_, need ? SW_SHOWNA : SW_HIDE);
+    }
     InvalidateRect(hwnd_, &statusRc_, FALSE);
 }
 
@@ -501,6 +583,8 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         case IDM_REINDEX: StartIndex(true); break;
         case IDM_THEME_SYSTEM: case IDM_THEME_LIGHT: case IDM_THEME_DARK:
             GetSettings().theme = static_cast<ThemeMode>(id - IDM_THEME_SYSTEM); ApplyTheme(); break;
+        case IDM_INSTALL_SVC: case IDC_SVC_BTN: ServiceAction(true); break;
+        case IDM_UNINSTALL_SVC: ServiceAction(false); break;
         case IDM_DOUBLE_CTRL:
             GetSettings().doubleCtrl = !GetSettings().doubleCtrl;
             if (GetSettings().doubleCtrl) hotkeys_.EnableDoubleCtrl(hwnd_); else hotkeys_.DisableDoubleCtrl();
@@ -541,6 +625,7 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         switch (LOWORD(l)) {
         case WM_LBUTTONUP: case NIN_SELECT: case NIN_KEYSELECT: Toggle(); break;
         case WM_CONTEXTMENU: case WM_RBUTTONUP: TrayMenu(); break;
+        case NIN_BALLOONUSERCLICK: if (indexer_.Stats().needService) { ShowAndFocus(); ServiceAction(true); } break;
         }
         return 0;
     case WM_APP_RESULTS: {

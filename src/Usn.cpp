@@ -31,9 +31,9 @@ bool ParseUsnRecords(const uint8_t* p, size_t n, std::vector<UsnEvent>& out, std
         e.frn = r.FileReferenceNumber; e.parent = r.ParentFileReferenceNumber;
         e.reason = r.Reason; e.attrs = r.FileAttributes; e.usn = r.Usn; e.time = r.TimeStamp.QuadPart;
         e.name.assign(reinterpret_cast<const wchar_t*>(p + off + r.FileNameOffset), r.FileNameLength / 2);
-        if (logBudget > 0) {
+        if (logBudget > 0) {   // 仅 -debug-log
             --logBudget;
-            Log(L"USN: parent %016I64x frn %016I64x reason %08x %s", e.parent, e.frn, e.reason, e.name.c_str());
+            Log(L"USN_RECORD: parent %016I64x frn %016I64x reason %08x %s", e.parent, e.frn, e.reason, e.name.c_str());
         }
         out.push_back(std::move(e));
         off += len;
@@ -64,7 +64,8 @@ void LiveUpdater::SetFilter(uint32_t vol, std::vector<std::wstring> excludes, st
 void LiveUpdater::Rebase(std::shared_ptr<const IndexData> base) {
     base_ = std::move(base); work_.reset();
     for (auto& v : vols_) { v.built = false; v.sorted.clear(); v.added.clear(); }
-    removed_.clear(); insert_.clear(); deletedDirs_.clear(); folderDelta_ = fileDelta_ = 0;
+    removed_.clear(); insert_.clear(); folderDelta_ = fileDelta_ = 0;
+    firstChild_.clear(); nextSib_.clear(); childBuilt_ = false;
 }
 
 void LiveUpdater::EnsureWork() {
@@ -94,6 +95,16 @@ void LiveUpdater::EnsureFrnIndex(uint32_t vol) {
         }
     }
     for (auto& v : vols_) if (!v.built) { std::sort(v.sorted.begin(), v.sorted.end()); v.built = true; }
+    if (!childBuilt_) {
+        const size_t n = d.entries.size();
+        firstChild_.assign(n, kNoParent); nextSib_.assign(n, kNoParent);
+        for (size_t i = n; i-- > 0;) {   // 逆序头插：子链表按下标升序
+            const Entry& e = d.entries[i];
+            if (e.IsDeleted() || e.parent == kNoParent) continue;
+            nextSib_[i] = firstChild_[e.parent]; firstChild_[e.parent] = static_cast<uint32_t>(i);
+        }
+        childBuilt_ = true;
+    }
     st_.frnIndexMs += Ms(t);
 }
 
@@ -109,6 +120,73 @@ size_t LiveUpdater::Find(uint32_t vol, uint64_t frn) const {
     }
     if (idx == SIZE_MAX || d.entries[idx].IsDeleted()) return SIZE_MAX;
     return idx;
+}
+
+void LiveUpdater::Link(uint32_t child, uint32_t parent) {
+    if (firstChild_.size() <= child) { firstChild_.resize(child + 1, kNoParent); nextSib_.resize(child + 1, kNoParent); }
+    if (parent == kNoParent) return;
+    nextSib_[child] = firstChild_[parent]; firstChild_[parent] = child;
+}
+
+void LiveUpdater::Unlink(uint32_t child, uint32_t parent) {
+    if (parent == kNoParent || parent >= firstChild_.size()) return;
+    uint32_t* p = &firstChild_[parent];
+    while (*p != kNoParent) { if (*p == child) { *p = nextSib_[child]; nextSib_[child] = kNoParent; return; } p = &nextSib_[*p]; }
+}
+
+// 文件夹删除：沿反向索引在内存中移除整棵子树（不做全量扫描）
+void LiveUpdater::RemoveTree(uint32_t idx, bool logIt) {
+    auto t = Clock::now();
+    EnsureWork();
+    auto& E = work_->entries;
+    std::wstring path;
+    if (logIt) { path = work_->FullPath(idx); Log(L"remove ntfs folder %s with children", path.c_str()); }
+    size_t dirs = 0, files = 0;
+    std::vector<uint32_t> stack;
+    for (uint32_t c = idx < firstChild_.size() ? firstChild_[idx] : kNoParent; c != kNoParent; c = nextSib_[c]) stack.push_back(c);
+    while (!stack.empty()) {
+        uint32_t i = stack.back(); stack.pop_back();
+        if (E[i].IsDeleted()) continue;
+        if (E[i].IsDir()) for (uint32_t c = i < firstChild_.size() ? firstChild_[i] : kNoParent; c != kNoParent; c = nextSib_[c]) stack.push_back(c);
+        Entry& x = E.Mut(i);
+        x.flags |= kFlagDeleted;
+        MarkRemoved(i);
+        if (x.IsDir()) { ++dirs; --folderDelta_; } else { ++files; --fileDelta_; }
+    }
+    st_.removedDirs += dirs; st_.removedFiles += files;
+    double ms = Ms(t); st_.subtreeMs += ms;
+    if (logIt) Log(L"removed %zu subfolders and %zu files from %s in %f seconds", dirs, files, path.c_str(), ms / 1000.0);
+}
+
+// 移入索引范围的文件夹（来自排除目录/范围外）：立即扫描该目录并把子树插入现有索引
+void LiveUpdater::ScanMovedIn(uint32_t vol, uint32_t dirIdx) {
+    if (!scanner_) return;
+    auto t = Clock::now();
+    std::wstring path = work_->FullPath(dirIdx);
+    Log(L"scanning %s", path.c_str());
+    VolumeData vd;
+    if (!scanner_(vol, path, vd) || vd.entries.empty()) { Log(L"scan failed: %s", path.c_str()); return; }
+    std::vector<uint32_t> map(vd.entries.size(), kNoParent);
+    map[0] = dirIdx;
+    size_t files = 0, dirs = 0;
+    for (size_t i = 1; i < vd.entries.size(); ++i) {
+        const Entry& s = vd.entries[i];
+        uint32_t p = s.parent < map.size() ? map[s.parent] : kNoParent;
+        if (p == kNoParent) continue;
+        uint64_t frn = i < vd.frn.size() ? vd.frn[i] : 0;
+        size_t ex = frn ? Find(vol, frn) : SIZE_MAX;
+        if (ex != SIZE_MAX) { map[i] = static_cast<uint32_t>(ex); continue; }   // 已在索引中（之后的 USN 记录先到）
+        std::wstring nm(vd.names.data() + s.nameOff, s.nameLen);
+        uint32_t ni = AddEntry(vol, nm, p, s.IsDir(), static_cast<int64_t>(s.mtime), frn);
+        work_->entries.Mut(ni).size = s.size;
+        map[i] = ni;
+        (s.IsDir() ? dirs : files)++;
+    }
+    ++st_.scans; st_.readdFiles += files; st_.readdFolders += dirs;
+    double ms = Ms(t); st_.scanMs += ms;
+    Log(L"scan completed in %f seconds", ms / 1000.0);
+    Log(L"readd files %zu", files);
+    Log(L"readd folders %zu", dirs);
 }
 
 void LiveUpdater::MarkRemoved(uint32_t id) {
@@ -129,6 +207,7 @@ uint32_t LiveUpdater::AddEntry(uint32_t vol, const std::wstring& name, uint32_t 
     if (d.frn.size() < idx) d.frn.resize(idx, 0);
     d.frn.push_back(frn);
     vols_[vol].added[frn] = idx;
+    Link(idx, parent);
     insert_.push_back(idx);
     if (dir) ++folderDelta_; else ++fileDelta_;
     return idx;
@@ -150,14 +229,14 @@ void LiveUpdater::Apply(uint32_t vol, const std::vector<UsnEvent>& ev, const Loo
     auto t = Clock::now();
     EnsureFrnIndex(vol);
     std::vector<uint32_t> need;
-    int logBudget = 200;
+    int logBudget = g_debugLog ? 200 : 0;
     auto removeOne = [&](size_t idx, const UsnEvent& e) {
         EnsureWork();
         Entry& x = work_->entries.Mut(idx);
         x.flags |= kFlagDeleted;
         MarkRemoved(static_cast<uint32_t>(idx));
-        if (x.IsDir()) { deletedDirs_.push_back(static_cast<uint32_t>(idx)); --folderDelta_; } else --fileDelta_;
         if (logBudget > 0) { --logBudget; Log(L"RESCAN DELETE %016I64x %s", e.frn, e.name.c_str()); }
+        if (x.IsDir()) { --folderDelta_; RemoveTree(static_cast<uint32_t>(idx), true); } else --fileDelta_;
         ++st_.deletes;
     };
     for (const UsnEvent& e : ev) {
@@ -168,7 +247,7 @@ void LiveUpdater::Apply(uint32_t vol, const std::vector<UsnEvent>& ev, const Loo
             size_t idx = Find(vol, e.frn);
             if (idx == SIZE_MAX) {
                 ++st_.notFound;
-                if (dir && logBudget > 0) { --logBudget; Log(L"unable to remove ntfs folder: %016I64x: file not found", e.frn); }
+                if (dir) Log(L"unable to remove ntfs folder: %016I64x: file not found", e.frn);
                 continue;
             }
             if ((work_ ? *work_ : *base_).entries[idx].parent == kNoParent) continue;   // 卷根
@@ -184,6 +263,7 @@ void LiveUpdater::Apply(uint32_t vol, const std::vector<UsnEvent>& ev, const Loo
             uint32_t ni = AddEntry(vol, e.name, static_cast<uint32_t>(pidx), dir, e.time, e.frn);
             need.push_back(ni);
             ++st_.creates;
+            if (dir && (r & USN_REASON_RENAME_NEW_NAME)) ScanMovedIn(vol, ni);   // 从范围外移入：子项不会有 USN 记录
             continue;
         }
         const IndexData& d = *(work_ ? work_ : std::const_pointer_cast<IndexData>(base_));
@@ -200,6 +280,7 @@ void LiveUpdater::Apply(uint32_t vol, const std::vector<UsnEvent>& ev, const Loo
                 x.nameLen = static_cast<uint16_t>(len);
                 insert_.push_back(static_cast<uint32_t>(idx));
             }
+            if (x.parent != pidx) { Unlink(static_cast<uint32_t>(idx), x.parent); Link(static_cast<uint32_t>(idx), static_cast<uint32_t>(pidx)); }
             x.parent = static_cast<uint32_t>(pidx);
             ++st_.renames;
             continue;
@@ -214,15 +295,17 @@ void LiveUpdater::Apply(uint32_t vol, const std::vector<UsnEvent>& ev, const Loo
     }
     if (lookup && !need.empty() && work_) {
         std::sort(need.begin(), need.end()); need.erase(std::unique(need.begin(), need.end()), need.end());
-        for (uint32_t i : need) {
-            if (work_->entries[i].IsDeleted()) continue;
-            uint64_t size = 0, mtime = 0;
-            ++st_.lookups;
-            if (lookup(vol, work_->frn[i], size, mtime)) {
-                Entry& x = work_->entries.Mut(i);
-                if (!x.IsDir()) x.size = size;
-                if (mtime) x.mtime = mtime;
-            }
+        need.erase(std::remove_if(need.begin(), need.end(), [&](uint32_t i) { return work_->entries[i].IsDeleted(); }), need.end());
+        std::vector<uint64_t> frns; frns.reserve(need.size());
+        for (uint32_t i : need) frns.push_back(work_->frn[i]);
+        std::vector<LookupResult> res;
+        lookup(vol, frns, res);
+        st_.lookups += frns.size();
+        for (size_t k = 0; k < need.size() && k < res.size(); ++k) {
+            if (!res[k].sizeOk && !res[k].timeOk) continue;   // 全部失败：保留旧值
+            Entry& x = work_->entries.Mut(need[k]);
+            if (res[k].sizeOk && !x.IsDir()) x.size = res[k].size;
+            if (res[k].timeOk && res[k].mtime) x.mtime = res[k].mtime;
         }
     }
     st_.applyMs += Ms(t);
@@ -233,40 +316,6 @@ std::shared_ptr<IndexData> LiveUpdater::Commit() {
     auto t = Clock::now();
     IndexData& wd = *work_;
     const IndexData& bd = *base_;
-    // 1) 删除的文件夹：在内存中移除整棵子树（一次 O(n) 扫描，带记忆）
-    if (!deletedDirs_.empty()) {
-        const size_t n = wd.entries.size();
-        constexpr uint32_t kUnk = 0xFFFFFFFEu, kAlive = kNoParent;
-        std::vector<uint32_t> top(n, kUnk), stack;
-        std::unordered_map<uint32_t, std::pair<size_t, size_t>> counts;
-        for (size_t i = 0; i < n; ++i) {
-            if (top[i] != kUnk) continue;
-            if (wd.entries[i].IsDeleted()) { top[i] = static_cast<uint32_t>(i); continue; }
-            stack.clear(); stack.push_back(static_cast<uint32_t>(i));
-            uint32_t p = wd.entries[i].parent, res;
-            for (;;) {
-                if (p == kNoParent) { res = kAlive; break; }
-                if (top[p] != kUnk) { res = top[p]; break; }
-                if (wd.entries[p].IsDeleted()) { top[p] = p; res = p; break; }
-                stack.push_back(p); p = wd.entries[p].parent;
-                if (stack.size() > 4096) { res = kAlive; break; }   // 防环
-            }
-            for (uint32_t s : stack) {
-                top[s] = res;
-                if (res != kAlive) {
-                    Entry& x = wd.entries.Mut(s);
-                    x.flags |= kFlagDeleted;
-                    MarkRemoved(s);
-                    auto& c = counts[res];
-                    if (x.IsDir()) { ++c.first; --folderDelta_; } else { ++c.second; --fileDelta_; }
-                }
-            }
-        }
-        for (auto& [root, c] : counts) {
-            st_.removedDirs += c.first; st_.removedFiles += c.second;
-            Log(L"removed %zu subfolders and %zu files from %s", c.first, c.second, wd.FullPath(root).c_str());
-        }
-    }
     // 2) byName：二分定位删除位置与插入位置，单次线性合并（不整体排序）
     const auto& B = bd.byName;
     auto lessB = [&](uint32_t a, uint32_t b) { int c = CompareFold(bd.Name(a), bd.Name(b)); return c ? c < 0 : a < b; };
@@ -304,7 +353,7 @@ std::shared_ptr<IndexData> LiveUpdater::Commit() {
     st_.chunkClones += wd.entries.Clones() + wd.frn.Clones();
     auto res = work_;
     base_ = work_; work_.reset();
-    removed_.clear(); insert_.clear(); deletedDirs_.clear(); folderDelta_ = fileDelta_ = 0;
+    removed_.clear(); insert_.clear(); folderDelta_ = fileDelta_ = 0;
     st_.commitMs += Ms(t);
     return res;
 }

@@ -4,6 +4,7 @@
 #include "Fold.h"
 #include "Log.h"
 #include "MftIndexer.h"
+#include "NtfsSource.h"
 #include "Settings.h"
 #include "Usn.h"
 #include "Util.h"
@@ -151,6 +152,48 @@ std::shared_ptr<IndexData> Merge(std::vector<VolumeData>& vols, uint64_t configH
     });
     return d;
 }
+
+std::shared_ptr<IndexData> ClearGhosts(const IndexData& d, size_t* cleared) {
+    auto t = Clock::now();
+    const size_t n = d.entries.size();
+    std::vector<uint32_t> map(n, kNoParent);
+    // 存活 = 未删除且父链存活（子树删除已保证这一点；这里再防御一次）
+    std::vector<uint8_t> alive(n);
+    for (size_t i = 0; i < n; ++i) alive[i] = !d.entries[i].IsDeleted();
+    for (int pass = 0; pass < 64; ++pass) {
+        bool ch = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (!alive[i]) continue;
+            uint32_t p = d.entries[i].parent;
+            if (p != kNoParent && (p >= n || !alive[p])) { alive[i] = 0; ch = true; }
+        }
+        if (!ch) break;
+    }
+    uint32_t m = 0;
+    for (size_t i = 0; i < n; ++i) if (alive[i]) map[i] = m++;
+    auto o = std::make_shared<IndexData>();
+    o->volumes = d.volumes; o->configHash = d.configHash; o->dbVersion = d.dbVersion;
+    o->entries.resize(m);
+    const bool hasFrn = d.frn.size() == n;
+    if (hasFrn) o->frn.resize(m);
+    for (size_t i = 0; i < n; ++i) {
+        if (map[i] == kNoParent) continue;
+        Entry e = d.entries[i];
+        e.parent = e.parent == kNoParent ? kNoParent : map[e.parent];
+        e.nameOff = o->names.Append(d.names.At(d.entries[i].nameOff), e.nameLen);
+        o->entries.Mut(map[i]) = e;
+        if (hasFrn) o->frn.Mut(map[i]) = d.frn[i];
+        if (e.IsDir()) ++o->folders; else ++o->files;
+    }
+    // byName：下标单调重映射，顺序（名称，下标）保持不变，无需重新排序
+    o->byName.reserve(d.byName.size());
+    for (uint32_t id : d.byName) if (map[id] != kNoParent) o->byName.push_back(map[id]);
+    if (cleared) *cleared = n - m;
+    Log(L"deleteme: cleared %zu ghosts of %zu entries in %f seconds", n - m, n, Sec(t));
+    return o;
+}
+
+static size_t Ghosts(const IndexData& d) { return d.entries.size() - d.folders - d.files; }
 
 VolumeData ExtractVolume(const IndexData& d, uint32_t vol) {
     VolumeData v;
@@ -315,13 +358,14 @@ bool Indexer::BuildVolume(VolumeData& v, const Options& opt, std::wstring& note)
         Log(L"%s: 文件夹索引 %zu 个对象，用时 %.2f 秒", v.info.root.c_str(), v.entries.size(), Sec(t));
         return !stop_;
     }
-    if (!MftIndexer::IsElevated()) {
-        adminVols_ += (adminVols_.empty() ? L"" : L" ") + v.info.root;
-        Log(L"%s: 无法读取 MFT（未提升权限），卷需要重建", v.info.root.c_str());
+    if (!src_) {
+        if (adminVols_.find(v.info.root) == std::wstring::npos) adminVols_ += (adminVols_.empty() ? L"" : L" ") + v.info.root;
+        Log(L"%s: 无法读取 MFT（没有 FlashFind 服务且未提升权限），卷需要重建", v.info.root.c_str());
         return false;
     }
     std::wstring err;
-    if (MftIndexer::Build(v, vc ? vc->enableUsnJournal : true, stop_, progress_, err)) {
+    Log(L"%s: 通过%s读取 MFT", v.info.root.c_str(), src_->Kind());
+    if (src_->Build(v, vc ? vc->enableUsnJournal : true, stop_, progress_, err)) {
         ApplyFilters(v, ex, vc ? vc->includeOnly : std::vector<std::wstring>{});
         Log(L"%s: MFT 建立 %zu 个对象，用时 %.2f 秒", v.info.root.c_str(), v.entries.size(), Sec(t));
         return true;
@@ -339,13 +383,21 @@ void Indexer::Run(HWND hwnd, Options opt) {
     InitFold();
     for (auto& r : opt.roots) while (!r.empty() && r.back() == L'\\') r.pop_back();
     const uint64_t cfg = ConfigHash(opt.excludes, opt.volumes);
-    const bool elevated = MftIndexer::IsElevated();
+    // 特权来源：已提升 -> 本进程；否则连接 FlashFind 服务；都没有 -> 只加载旧数据并提示
+    std::unique_ptr<NtfsSource> srcHolder;
+    std::wstring why;
+    if (MftIndexer::IsElevated()) srcHolder = MakeLocalSource();
+    else srcHolder = ConnectService(opt.allowConsoleService, &why);
+    if (!srcHolder && !why.empty()) Log(L"FlashFind 服务不可用：%s", why.c_str());
+    src_ = srcHolder.get();
+    struct ClearSrc { NtfsSource*& p; ~ClearSrc() { p = nullptr; } } clearSrc{src_};
     IndexStats st;
     progress_ = 0;
     auto setStats = [&] { std::lock_guard lk(mu_); stats_ = st; };
     auto finish = [&] { busy_ = false; phase_ = IndexPhase::Idle; if (hwnd) PostMessageW(hwnd, WM_APP_INDEX_PROGRESS, 0, 0); };
     { std::lock_guard lk(mu_); stats_ = {}; }
     adminVols_.clear();
+    st.source = src_ ? src_->Kind() : L"";
     auto volCfg = [&](const std::wstring& root) { const VolumeConfig* c = opt.Vol(root); static const VolumeConfig def; return c ? *c : def; };
     auto rootOnly = [&](const std::wstring& r) {
         VolumeData v; v.info.root = r; uint32_t s = 0; v.info.ntfs = MftIndexer::IsNtfs(r, &s); v.info.serial = s;
@@ -375,30 +427,31 @@ void Indexer::Run(HWND hwnd, Options opt) {
     std::wstring note;
     bool recordsChanged = false, cursorMoved = false;
     std::vector<VolumeInfo> vs;
-    // 管理员：每卷一个卷句柄，用于读 USN 与单条记录查询（大小/时间）
-    std::vector<HANDLE> vh;
-    std::vector<uint32_t> recSize;
-    auto openVol = [&](uint32_t vi) -> HANDLE {
-        if (vh.size() <= vi) { vh.resize(vi + 1, INVALID_HANDLE_VALUE); recSize.resize(vi + 1, 0); }
-        if (vh[vi] == INVALID_HANDLE_VALUE) { vh[vi] = MftIndexer::OpenVolumeRead(vs[vi].root); if (vh[vi] != INVALID_HANDLE_VALUE) recSize[vi] = MftIndexer::RecordSize(vh[vi]); }
-        return vh[vi];
-    };
-    auto closeVols = [&] { for (auto h : vh) if (h != INVALID_HANDLE_VALUE) CloseHandle(h); vh.clear(); recSize.clear(); };
-    LiveUpdater::Lookup lookup = [&](uint32_t vi, uint64_t frn, uint64_t& size, uint64_t& mtime) {
-        HANDLE h = openVol(vi);
-        return h != INVALID_HANDLE_VALUE && MftIndexer::LookupRecord(h, recSize[vi], frn, size, mtime);
+    LiveUpdater::Lookup lookup = [&](uint32_t vi, const std::vector<uint64_t>& frns, std::vector<LookupResult>& out) {
+        if (src_) src_->Lookup(vs[vi].root, frns, out);
     };
     std::unique_ptr<LiveUpdater> upd;
     auto setFilters = [&] {
         for (uint32_t vi = 0; vi < vs.size(); ++vi) upd->SetFilter(vi, ExcludesOn(opt.excludes, vs[vi].root), volCfg(vs[vi].root).includeOnly);
+        upd->SetScanner([&](uint32_t vi, const std::wstring& path, VolumeData& out) {
+            std::wstring e2;
+            return src_ && src_->ScanDir(vs[vi].root, path, ExcludesOn(opt.excludes, vs[vi].root), out, e2);
+        });
     };
     // 读一卷的 USN（只用带名称的特权记录）；返回 0 或 Win32 错误
     auto readVol = [&](uint32_t vi, std::vector<UsnEvent>& ev, int64_t& next) -> DWORD {
-        HANDLE h = openVol(vi);
-        if (h == INVALID_HANDLE_VALUE) return GetLastError() ? GetLastError() : ERROR_ACCESS_DENIED;
-        std::wstring e2;
+        if (!src_) return ERROR_ACCESS_DENIED;
+        std::wstring e2; std::vector<uint8_t> raw;
         next = vs[vi].nextUsn;
-        return MftIndexer::ReadUsn(h, vs[vi].journalId, next, ev, e2);
+        DWORD e = src_->ReadUsn(vs[vi].root, vs[vi].journalId, next, raw, e2);
+        if (e) return e;
+        int budget = g_debugLog ? 1000 : 0;
+        if (!ParseUsnRecords(raw.data(), raw.size(), ev, e2, budget)) { next = vs[vi].nextUsn; return ERROR_INVALID_DATA; }
+        return 0;
+    };
+    auto closeVols = [] {};
+    auto queryJournal = [&](const std::wstring& root, bool create, uint64_t& jid, int64_t& first, int64_t& next, std::wstring& e2) {
+        return src_ ? src_->QueryJournal(root, create, jid, first, next, e2) : MftIndexer::QueryJournal(root, false, jid, first, next, e2);
     };
 
     if (cur) {
@@ -425,11 +478,11 @@ void Indexer::Run(HWND hwnd, Options opt) {
             if (excludesChanged) { stale[vi] = 1; continue; }
             if (!v.mft || v.journalId == 0) { Log(L"%s: Journal ID changed（未记录 -> 需要 MFT 重建），卷标记为过期，继续显示旧数据", v.root.c_str()); stale[vi] = 1; continue; }
             uint64_t jid = 0; int64_t first = 0, next = 0;
-            if (!MftIndexer::QueryJournal(v.root, volCfg(v.root).enableUsnJournal, jid, first, next, err)) { Log(L"%s: %s，卷需要重建", v.root.c_str(), err.c_str()); stale[vi] = 1; continue; }
+            if (!queryJournal(v.root, volCfg(v.root).enableUsnJournal, jid, first, next, err)) { Log(L"%s: %s，卷需要重建", v.root.c_str(), err.c_str()); stale[vi] = 1; continue; }
             if (jid != v.journalId) { Log(L"%s: Journal ID changed（%016I64X -> %016I64X），卷需要重建", v.root.c_str(), v.journalId, jid); stale[vi] = 1; continue; }
             if (v.nextUsn < first) { Log(L"%s: 保存的 USN %I64d 早于 Journal 起点 %I64d（已截断），卷需要重建", v.root.c_str(), v.nextUsn, first); stale[vi] = 1; continue; }
             if (next <= v.nextUsn) continue;
-            if (!elevated) {   // 非特权记录没有文件名：不用于修补；游标不动
+            if (!src_) {   // 非特权记录没有文件名：不用于修补；游标不动
                 needAdmin[vi] = 1;
                 adminVols_ += (adminVols_.empty() ? L"" : L" ") + v.root;
                 Log(L"%s: 有 %I64d 字节的新 USN 记录，但只能读取无文件名的非特权记录，不用于修补；需要 FlashFind 服务或管理员", v.root.c_str(), next - v.nextUsn);
@@ -442,7 +495,12 @@ void Indexer::Run(HWND hwnd, Options opt) {
                 else Log(L"ntfs monitor read error %lu retrying in 30 seconds", e);
                 continue;
             }
-            upd->Apply(vi, ev, lookup);
+            {
+                LogBatch lb;
+                auto tp = Clock::now();
+                upd->Apply(vi, ev, lookup);
+                if (!ev.empty()) Log(L"%s: processed ntfs usn records in %f seconds（%zu 条）", v.root.c_str(), Sec(tp), ev.size());
+            }
             if (nx != v.nextUsn) { v.nextUsn = nx; cursorMoved = true; }
         }
         // 过期卷 / 新卷：只重建该卷（NTFS 用 MFT，需要管理员）；做不到就保留旧数据并提示
@@ -515,7 +573,7 @@ void Indexer::Run(HWND hwnd, Options opt) {
         vs = cur->volumes;
         recordsChanged = true;
     }
-    if (!adminVols_.empty()) note = adminVols_ + L" 需要读取 NTFS 主文件表 / 带文件名的 USN 记录才能更新：请以管理员身份运行闪寻，或安装 FlashFind 服务。" + note;
+    if (!adminVols_.empty()) { note = adminVols_ + L": install FlashFind service or run as admin to index this volume" + (note.empty() ? L"" : L"；" + note); st.needService = true; }
     st.note = note;
     if (!note.empty()) Log(L"%s", note.c_str());
 
@@ -523,6 +581,12 @@ void Indexer::Run(HWND hwnd, Options opt) {
         auto t = Clock::now();
         phase_ = IndexPhase::Saving;
         if (full) {
+            if (Ghosts(*cur)) {   // 保存前清除幽灵条目（不重读 MFT、不重新排序）
+                auto c2 = ClearGhosts(*cur, &st.ghostsCleared);
+                cur = c2;
+                if (upd) upd->Rebase(cur);
+                Publish(hwnd, cur);
+            }
             cur->volumes = vs; cur->configHash = cfg; cur->dbVersion = kDbVersion;
             if (SaveDb(opt.dbPath, *cur, opt.compress, &st.dbBytes)) { st.saveSec = Sec(t); st.fullSave = true; Log(L"保存数据库 %llu 字节，用时 %.2f 秒", st.dbBytes, st.saveSec); }
         } else if (UpdateDbVolumes(opt.dbPath, vs)) {
@@ -539,7 +603,7 @@ void Indexer::Run(HWND hwnd, Options opt) {
     std::vector<uint8_t> mon(vs.size(), 0);
     bool anyMon = false;
     for (uint32_t vi = 0; vi < vs.size(); ++vi) {
-        mon[vi] = opt.monitor && elevated && vs[vi].ntfs && vs[vi].mft && vs[vi].journalId && volCfg(vs[vi].root).monitor;
+        mon[vi] = opt.monitor && src_ && vs[vi].ntfs && vs[vi].mft && vs[vi].journalId && volCfg(vs[vi].root).monitor;
         anyMon = anyMon || mon[vi];
     }
     if (!anyMon) { closeVols(); return; }
@@ -551,6 +615,15 @@ void Indexer::Run(HWND hwnd, Options opt) {
         for (int k = 0; k < std::max(1, opt.monitorDelayMs / 50) && !stop_; ++k) Sleep(50);
         if (stop_) break;
         bool rebuiltAny = false;
+        LogBatch lb;   // 每批一次写日志
+        if (src_ && !src_->Alive()) {   // 服务连接断开：重连
+            std::wstring w2;
+            srcHolder = MftIndexer::IsElevated() ? MakeLocalSource() : ConnectService(opt.allowConsoleService, &w2);
+            src_ = srcHolder.get();
+            if (!src_) { Log(L"ntfs monitor read error %lu retrying in 30 seconds", ERROR_BROKEN_PIPE); for (int k = 0; k < 600 && !stop_; ++k) Sleep(50); continue; }
+        }
+        if (!src_) break;
+        auto tBatch = Clock::now(); size_t nEv = 0;
         for (uint32_t vi = 0; vi < vs.size() && !stop_; ++vi) {
             if (!mon[vi] || Clock::now() < retryAt[vi]) continue;
             std::vector<UsnEvent> ev; int64_t nx = 0;
@@ -574,13 +647,13 @@ void Indexer::Run(HWND hwnd, Options opt) {
                 } else {
                     Log(L"ntfs monitor read error %lu retrying in 30 seconds", e);
                     retryAt[vi] = Clock::now() + std::chrono::seconds(30);
-                    if (vi < vh.size() && vh[vi] != INVALID_HANDLE_VALUE) { CloseHandle(vh[vi]); vh[vi] = INVALID_HANDLE_VALUE; }
                 }
                 continue;
             }
-            if (!ev.empty()) upd->Apply(vi, ev, lookup);
+            if (!ev.empty()) { upd->Apply(vi, ev, lookup); nEv += ev.size(); }
             if (nx != vs[vi].nextUsn) { vs[vi].nextUsn = nx; cursorMoved = true; }
         }
+        if (nEv) Log(L"processed ntfs usn records in %f seconds（%zu 条）", Sec(tBatch), nEv);
         if (upd->Dirty()) {
             cur = upd->Commit();
             cur->volumes = vs;
@@ -590,6 +663,12 @@ void Indexer::Run(HWND hwnd, Options opt) {
             Log(L"rescan update db: %zu 条记录，新建 %zu 删除 %zu 改名 %zu 修改 %zu，插入 %zu 移除 %zu，用时 %.1f+%.1f ms",
                 s2.events, s2.creates, s2.deletes, s2.renames, s2.modifies, s2.inserted, s2.removed, s2.applyMs, s2.commitMs);
             upd->ResetStats();
+            if (Ghosts(*cur) * 10 > cur->entries.size()) {   // 幽灵超过 10%：压缩
+                cur = ClearGhosts(*cur, nullptr);
+                cur->volumes = vs;
+                upd->Rebase(cur); setFilters();
+                Publish(hwnd, cur);
+            }
         } else if (rebuiltAny) { cur->volumes = vs; Publish(hwnd, cur); dbDirty = true; }
     }
     closeVols();

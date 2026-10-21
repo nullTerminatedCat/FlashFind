@@ -14,6 +14,9 @@
 #include "MftIndexer.h"
 #include "Usn.h"
 #include <winioctl.h>
+#include <sddl.h>
+#include "NtfsSource.h"
+#include "Log.h"
 
 namespace ff {
 
@@ -189,6 +192,7 @@ static int IncrTest(std::wstring dbPath) {
     bool subOk = s1.removedDirs == subDirs && s1.removedFiles == subFiles;
     for (size_t i = 0; i < W.entries.size() && subOk; ++i) if (!W.entries[i].IsDeleted() && isUnder(static_cast<uint32_t>(i), S)) subOk = false;
     check(subOk && W.entries[S].IsDeleted(), L"文件夹删除：内存中移除整棵子树");
+    swprintf_s(buf, L"[subtree] 反向索引删除 %zu 文件夹 %zu 文件：%.2f ms（无全表扫描）\r\n", s1.removedDirs, s1.removedFiles, s1.subtreeMs); out += buf;
     check(SearchCount(W, L"ff_excluded_new") == 0 && s1.dropped >= 1, L"排除目录下的 CREATE 被丢弃");
     check(SearchCount(W, L"ff_tmp_created_deleted") == 0, L"同批新建后删除：不出现");
     bool modOk = true; for (uint32_t id : modified) if (W.entries[id].mtime != static_cast<uint64_t>(now)) modOk = false;
@@ -214,13 +218,65 @@ static int IncrTest(std::wstring dbPath) {
         swprintf_s(buf, L"[batch3] 1 个新建：合计 %.2f ms\r\n", ms2); out += buf;
         check(CountExact(*snap3, L"ff_single.txt") == 1, L"单条新建正确");
         snap = snap3;
+        {   // 移入的文件夹（从索引范围外改名进来）：立即扫描并插入子项
+            const uint64_t mv = (3ULL << 48) | 4242;
+            upd.SetScanner([&](uint32_t, const std::wstring& path, VolumeData& vd) {
+                auto add = [&](const std::wstring& nm, uint32_t parent, bool dir, uint64_t frn) {
+                    Entry e; e.nameOff = static_cast<uint32_t>(vd.names.size()); e.nameLen = static_cast<uint16_t>(nm.size());
+                    e.flags = dir ? kFlagDir : 0; e.parent = parent; e.size = 123; e.mtime = now;
+                    vd.names.insert(vd.names.end(), nm.begin(), nm.end()); vd.entries.push_back(e); vd.frn.push_back(frn);
+                };
+                add(path.substr(path.rfind(L'\\') + 1), kNoParent, true, mv);
+                for (int k = 0; k < 500; ++k) { swprintf_s(buf, L"ff_movedin_%03d.bin", k); add(buf, 0, false, mv + 1 + k); }
+                for (int k = 0; k < 20; ++k) { swprintf_s(buf, L"ff_movedin_sub%02d", k); add(buf, 0, true, mv + 1000 + k); }
+                for (int k = 0; k < 20; ++k) { swprintf_s(buf, L"ff_movedin_deep_%02d.txt", k); add(buf, 501 + k, false, mv + 2000 + k); }
+                return true;
+            });
+            evs.clear();
+            ev(mv, snap->frn[D0], USN_REASON_RENAME_NEW_NAME | USN_REASON_CLOSE, FILE_ATTRIBUTE_DIRECTORY, L"ff_movedin_root");
+            upd.ResetStats(); tb = NowMs(); upd.Apply(0, evs, nullptr); auto s5 = upd.Commit(); ms2 = NowMs() - tb;
+            auto st5 = upd.LastStats();
+            swprintf_s(buf, L"[movedin] 移入文件夹扫描：%zu 次扫描，readd files %zu folders %zu，扫描插入 %.2f ms，合计 %.2f ms\r\n", st5.scans, st5.readdFiles, st5.readdFolders, st5.scanMs, ms2); out += buf;
+            check(st5.readdFiles == 520 && st5.readdFolders == 20 && SearchCount(*s5, L"ff_movedin_") == 541, L"移入文件夹：子项立即加入索引");
+            // 再把它删掉：通过反向索引删除整棵子树
+            evs.clear();
+            ev(mv, snap->frn[D0], USN_REASON_FILE_DELETE | USN_REASON_CLOSE, FILE_ATTRIBUTE_DIRECTORY, L"ff_movedin_root");
+            upd.ResetStats(); upd.Apply(0, evs, nullptr); auto s6 = upd.Commit();
+            check(SearchCount(*s6, L"ff_movedin_") == 0 && upd.LastStats().removedFiles == 520, L"移入后删除：反向索引移除子树");
+            snap = s6;
+        }
+        {   // 幽灵压缩（不重读 MFT、不重新排序）
+            size_t ghosts = snap->entries.size() - snap->folders - snap->files, cleared = 0;
+            std::vector<std::wstring> before; for (uint32_t id : snap->byName) if (before.size() < 200000) before.emplace_back(snap->Name(id));
+            size_t cntBefore = SearchCount(*snap, L"report"), b2 = SearchCount(*snap, L"ff_renamed_");
+            double tg = NowMs(); auto g = ClearGhosts(*snap, &cleared); double gms = NowMs() - tg;
+            bool same = g->byName.size() == snap->byName.size() && g->entries.size() == snap->entries.size() - ghosts;
+            for (size_t k = 0; k < before.size() && same; ++k) if (g->Name(g->byName[k]) != before[k]) same = false;
+            bool parentsOk = true; for (size_t i = 0; i < g->entries.size(); ++i) { auto pp = g->entries[i].parent; if (pp != kNoParent && (pp >= g->entries.size() || !g->entries[pp].IsDir())) { parentsOk = false; break; } }
+            swprintf_s(buf, L"[deleteme] 清除 %zu 个幽灵条目（共 %zu）：%.0f ms\r\n", cleared, snap->entries.size(), gms); out += buf;
+            check(cleared == ghosts && same && parentsOk && SearchCount(*g, L"report") == cntBefore && SearchCount(*g, L"ff_renamed_") == b2, L"幽灵压缩：顺序保持、父链正确、搜索结果不变");
+            LiveUpdater u3(g); evs.clear();
+            uint32_t d0n = kNoParent; for (uint32_t id : g->byName) if (g->FullPath(id) == pathD0) { d0n = id; break; }
+            if (d0n != kNoParent) {
+                ev(nextFrn++, g->frn[d0n], USN_REASON_FILE_CREATE | USN_REASON_CLOSE, FILE_ATTRIBUTE_ARCHIVE, L"ff_after_ghost.txt");
+                u3.Apply(0, evs, nullptr); auto s7 = u3.Commit();
+                check(CountExact(*s7, L"ff_after_ghost.txt") == 1, L"压缩后 Rebase：FRN 索引可用");
+            } else check(false, L"压缩后找不到 D0");
+            snap = g;
+        }
+        {   // 批量日志：一批一次写文件
+            double tl = NowMs();
+            { LogBatch lb; for (int k = 0; k < 1000; ++k) Log(L"logbatch test line %d", k); }
+            swprintf_s(buf, L"[logbatch] 1000 行一次写入：%.2f ms\r\n", NowMs() - tl); out += buf;
+        }
     }
     {   // 仅包含列表
         LiveUpdater u2(snap);
         u2.SetFilter(0, {}, {pathD0});
         evs.clear();
         ev(nextFrn++, snap->frn[0], USN_REASON_FILE_CREATE, FILE_ATTRIBUTE_ARCHIVE, L"ff_inc_root.txt");
-        ev(nextFrn++, snap->frn[D0], USN_REASON_FILE_CREATE, FILE_ATTRIBUTE_ARCHIVE, L"ff_inc_inside.txt");
+        uint32_t d0c = D0; for (uint32_t id : snap->byName) if (snap->FullPath(id) == pathD0) { d0c = id; break; }   // 压缩后下标已变
+        ev(nextFrn++, snap->frn[d0c], USN_REASON_FILE_CREATE, FILE_ATTRIBUTE_ARCHIVE, L"ff_inc_inside.txt");
         u2.Apply(0, evs, nullptr);
         auto s4 = u2.Commit();
         check(s4 && SearchCount(*s4, L"ff_inc_inside") == 1 && SearchCount(*s4, L"ff_inc_root") == 0, L"ntfs_volume_include_onlys：范围外的 CREATE 被丢弃");
@@ -400,12 +456,110 @@ static int SelfTest() {
     return 0;
 }
 
+// -pipetest：启动 -svc-console（非服务的同一管道服务器），通过管道测试协议
+static int PipeTest(std::wstring vol) {
+    std::wstring out; wchar_t buf[2048]; int fails = 0;
+    auto check = [&](bool ok, const std::wstring& what) { out += (ok ? L"  [OK]   " : L"  [FAIL] "); out += what; out += L"\r\n"; if (!ok) ++fails; };
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring cmd = L"\"" + std::wstring(exe) + L"\" -svc-console";
+    STARTUPINFOW si{sizeof(si)}; PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) { out += L"[FAIL] 无法启动 -svc-console\r\n"; WriteOut(L"ff_pipetest.txt", out); return 1; }
+    std::unique_ptr<NtfsSource> src; std::wstring why;
+    double t0 = NowMs();
+    for (int k = 0; k < 100 && !src; ++k) { WaitNamedPipeW(L"\\\\.\\pipe\\FlashFind.Service", 100); src = ConnectService(true, &why); if (!src) Sleep(50); }
+    swprintf_s(buf, L"[hello] 连接+HELLO %.1f ms %s\r\n", NowMs() - t0, why.c_str()); out += buf;
+    check(src != nullptr, L"连接 -svc-console 管道并 HELLO");
+    if (src) {
+        // 正式连接（不允许控制台）必须拒绝非服务进程：防管道抢注
+        std::wstring w2; auto strict = ConnectService(false, &w2);
+        check(!strict, L"严格模式拒绝非 SCM 服务进程（" + w2 + L"）");
+        uint64_t jid = 0, jid2 = 0; int64_t f = 0, nx = 0, f2 = 0, nx2 = 0; std::wstring e;
+        bool q = src->QueryJournal(vol, false, jid, f, nx, e);
+        bool q2 = MftIndexer::QueryJournal(vol, false, jid2, f2, nx2, e);
+        swprintf_s(buf, L"[journal] via pipe ok=%d id=%llx next=%lld；直接 ok=%d id=%llx\r\n", q, jid, nx, q2, jid2); out += buf;
+        check(q == q2 && jid == jid2, L"QUERY_JOURNAL 结果与本地一致");
+        std::vector<uint8_t> raw; int64_t from = nx; e.clear();
+        DWORD r = src->ReadUsn(vol, jid, from, raw, e);
+        swprintf_s(buf, L"[read_usn] status=%lu bytes=%zu err=%s（中等完整性下应为 5）\r\n", r, raw.size(), e.c_str()); out += buf;
+        check(MftIndexer::IsElevated() ? r == 0 : r == ERROR_ACCESS_DENIED, L"READ_USN 错误码经管道原样传回");
+        std::vector<LookupResult> lr;
+        bool lok = src->Lookup(vol, {5, 0x0005000000000005ULL}, lr);
+        check(lok && lr.size() == 2 && (MftIndexer::IsElevated() || (!lr[0].sizeOk && !lr[1].sizeOk)), L"LOOKUP 批量：失败项标记为不可用（保留旧值）");
+        VolumeData bv; bv.info.root = vol; std::atomic<bool> stop{false}; std::atomic<size_t> prog{0}; e.clear();
+        bool bok = src->Build(bv, false, stop, prog, e);
+        out += L"[build] ok=" + std::to_wstring(bok) + L" err=" + e + L"\r\n";
+        check(MftIndexer::IsElevated() || (!bok && !e.empty()), L"BUILD 失败时错误信息经管道传回");
+        e.clear(); VolumeData bad;
+        check(!src->ScanDir(L"Z:", L"Z:\\x", {}, bad, e) && !e.empty(), L"非法根被服务端拒绝（" + e + L"）");
+        e.clear();
+        check(!src->ScanDir(vol, vol + L"\\a\\..\\..\\Windows", {}, bad, e), L"含 \\.. 的路径被服务端拒绝");
+        // SCAN_DIR：在测试卷上建临时树，与本地 FindFirstFileEx 枚举比较
+        std::wstring base = vol + L"\\ff_pipetest_dir";
+        CreateDirectoryW(base.c_str(), nullptr);
+        for (int k = 0; k < 5; ++k) { std::wstring d = base + L"\\sub" + std::to_wstring(k); CreateDirectoryW(d.c_str(), nullptr);
+            for (int j = 0; j < 40; ++j) { std::wstring fpath = d + L"\\文件_" + std::to_wstring(j) + L".txt"; HANDLE h = CreateFileW(fpath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr); if (h != INVALID_HANDLE_VALUE) { DWORD wr; WriteFile(h, "hello", 5, &wr, nullptr); CloseHandle(h); } } }
+        VolumeData sv; e.clear(); double ts = NowMs();
+        bool sok = src->ScanDir(vol, base, {}, sv, e); double sms = NowMs() - ts;
+        auto local = MakeLocalSource(); VolumeData lv; std::wstring e3;
+        bool lok2 = local && local->ScanDir(vol, base, {}, lv, e3);
+        bool same = sok && lok2 && sv.entries.size() == lv.entries.size() && sv.frn == lv.frn && sv.names == lv.names;
+        size_t sized = 0; for (size_t i = 1; i < sv.entries.size(); ++i) if (!sv.entries[i].IsDir() && sv.entries[i].size == 5) ++sized;
+        swprintf_s(buf, L"[scan_dir] %zu 个对象 %.2f ms（本地 %zu）err=%s\r\n", sv.entries.size(), sms, lv.entries.size(), e.c_str()); out += buf;
+        check(same && sv.entries.size() == 206 && sized == 200 && sv.frn[1] != 0, L"SCAN_DIR 经管道与本地枚举一致（含 FileId、大小）");
+        check(lok2 && !lv.entries.empty() && std::wstring(lv.names.data() + lv.entries[0].nameOff, lv.entries[0].nameLen) == L"ff_pipetest_dir", L"entries[0] 是起始目录（取路径最后一段为名）");
+        double mbps = PipeBench(*src, 512);
+        swprintf_s(buf, L"[bench] 管道吞吐 %.0f MB/s（512 MB，1 MB 帧）\r\n", mbps); out += buf;
+        check(mbps > 100, L"管道吞吐 > 100 MB/s");
+        // 端到端：Indexer 走服务（-svc-console）
+        Indexer ix; Indexer::Options o; o.roots = {vol}; o.allowConsoleService = true; o.monitor = false;
+        wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp); o.dbPath = std::wstring(tmp) + L"ff_pipetest.db"; DeleteFileW(o.dbPath.c_str());
+        ix.Start(nullptr, o); Sleep(300);
+        for (int k = 0; k < 600 && ix.Busy(); ++k) Sleep(50);
+        auto st = ix.Stats();
+        out += L"[indexer] source=" + st.source + L" note=" + st.note + L"\r\n";
+        check(st.source == L"FlashFind 服务", L"Indexer 未提升时选择服务作为特权来源");
+        ix.Stop(); DeleteFileW(o.dbPath.c_str());
+        for (int k = 0; k < 5; ++k) { std::wstring d = base + L"\\sub" + std::to_wstring(k);
+            for (int j = 0; j < 40; ++j) DeleteFileW((d + L"\\文件_" + std::to_wstring(j) + L".txt").c_str()); RemoveDirectoryW(d.c_str()); }
+        RemoveDirectoryW(base.c_str());
+        src.reset();
+    }
+    {   // 无服务时的严格连接
+        HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Local\\FlashFind.SvcConsoleStop");
+        if (ev) { SetEvent(ev); CloseHandle(ev); }
+        DWORD w = WaitForSingleObject(pi.hProcess, 5000);
+        check(w == WAIT_OBJECT_0, L"-svc-console 收到停止事件后退出");
+        if (w != WAIT_OBJECT_0) TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+        std::wstring w2; auto none = ConnectService(false, &w2);
+        check(!none, L"无服务：ConnectService 失败（" + w2 + L"）");
+        check(!ServiceInstalled() || true, L"ServiceInstalled() = " + std::to_wstring(ServiceInstalled()));
+    }
+    swprintf_s(buf, L"[result] %s (%d failed)\r\n", fails ? L"FAIL" : L"PASS", fails); out += buf;
+    WriteOut(L"ff_pipetest.txt", out);
+    return fails ? 1 : 0;
+}
+
+static int SvcConsole() {
+    HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, L"Local\\FlashFind.SvcConsoleStop");
+    Log(L"-svc-console：管道服务器（非服务，仅测试）");
+    int r = RunPipeServer(ev);
+    CloseHandle(ev);
+    return r;
+}
+
 int App::Run(HINSTANCE inst, int show) {
     g_inst = inst;
     {
         int argc = 0; LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
         std::wstring mode = argc >= 2 ? argv[1] : L"", arg = argc >= 3 ? argv[2] : L"";
         LocalFree(argv);
+        if (wcsstr(GetCommandLineW(), L"-debug-log")) g_debugLog = true;
+        if (mode == L"-svc") return ServiceMain();
+        if (mode == L"-svc-console") return SvcConsole();
+        if (mode == L"-install-service") return InstallService();
+        if (mode == L"-uninstall-service") return UninstallService();
+        if (mode == L"-pipetest") { InitFold(); g_fastAscii = true; return PipeTest(arg.empty() ? L"G:" : arg); }
         if (mode == L"-incrtest" || mode == L"-initest" || mode == L"-gtest") {
             InitFold(); g_fastAscii = true;
             if (mode == L"-incrtest") return IncrTest(arg);

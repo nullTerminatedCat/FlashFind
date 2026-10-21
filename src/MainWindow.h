@@ -38,9 +38,12 @@ private:
     void ShowProperties();
     void ContextMenu(POINT screenPt);
     void TrayMenu();
+    void ServiceAction(bool install);
     void SavePlacement();
 
-    HWND hwnd_ = nullptr, edit_ = nullptr;
+    HWND hwnd_ = nullptr, edit_ = nullptr, svcBtn_ = nullptr;
+    HBITMAP shieldBmp_ = nullptr;
+    int svcBtnW_ = 0;
     ResultList list_;
     Indexer indexer_;
     std::unique_ptr<Searcher> searcher_;

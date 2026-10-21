@@ -74,12 +74,11 @@ uint32_t MftIndexer::RecordSize(HANDLE vol) {
     return nv.BytesPerFileRecordSegment;
 }
 
-DWORD MftIndexer::ReadUsn(HANDLE vol, uint64_t journalId, int64_t& from, std::vector<UsnEvent>& out, std::wstring& err) {
-    READ_USN_JOURNAL_DATA_V0 rd{};
+DWORD MftIndexer::ReadUsnRaw(HANDLE vol, uint64_t journalId, int64_t& from, std::vector<uint8_t>& raw) {
+    READ_USN_JOURNAL_DATA_V0 rd{};   // V0 输入 -> USN_RECORD_V2（带文件名）
     rd.StartUsn = from; rd.ReasonMask = 0xFFFFFFFF; rd.UsnJournalID = journalId;
     std::vector<uint8_t> buf(1 << 20);
-    int logBudget = 200;
-    for (int iter = 0; iter < 4096 && out.size() < 1000000; ++iter) {
+    for (int iter = 0; iter < 4096 && raw.size() < (256u << 20); ++iter) {
         DWORD got = 0;
         if (!DeviceIoControl(vol, FSCTL_READ_USN_JOURNAL, &rd, sizeof(rd), buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr)) {
             DWORD e = GetLastError();
@@ -91,7 +90,7 @@ DWORD MftIndexer::ReadUsn(HANDLE vol, uint64_t journalId, int64_t& from, std::ve
         }
         if (got < sizeof(USN)) break;
         USN next; memcpy(&next, buf.data(), sizeof(USN));
-        if (got > sizeof(USN) && !ParseUsnRecords(buf.data() + sizeof(USN), got - sizeof(USN), out, err, logBudget)) return ERROR_INVALID_DATA;
+        raw.insert(raw.end(), buf.begin() + sizeof(USN), buf.begin() + got);
         if (next <= rd.StartUsn) break;
         rd.StartUsn = next;
         if (got <= sizeof(USN)) break;
@@ -124,7 +123,11 @@ bool Fixup(uint8_t* r, uint32_t recSize, uint32_t sector) {
         uint32_t pos = k * sector - 2;
         if (pos + 2 > recSize) break;
         uint16_t v; memcpy(&v, r + pos, 2);
-        if (v != check) return false;          // 撕裂写/损坏
+        if (v != check) {                      // 撕裂写/损坏
+            static std::atomic<int> logged{0};
+            if (logged++ < 50) Log(L"bad US %x != %x", v, check);
+            return false;
+        }
         memcpy(r + pos, r + usaOff + 2 * k, 2);
     }
     return true;
@@ -154,7 +157,19 @@ struct Rec {
 };
 
 // FSCTL_GET_NTFS_FILE_RECORD 返回的记录可能已修正；修正失败不视为错误
-void TryFixup(std::vector<uint8_t>& r, uint32_t sector) { std::vector<uint8_t> c = r; if (Fixup(c.data(), static_cast<uint32_t>(c.size()), sector)) r.swap(c); }
+// FSCTL_GET_NTFS_FILE_RECORD 返回的记录已修正（本机已验证）：仅当每个扇区尾都等于 USN 时才修正，否则不动
+void FixupIfNeeded(std::vector<uint8_t>& rv, uint32_t sector) {
+    uint8_t* r = rv.data(); const uint32_t recSize = static_cast<uint32_t>(rv.size());
+    if (recSize < 0x30) return;
+    uint16_t usaOff, usaCnt; memcpy(&usaOff, r + 4, 2); memcpy(&usaCnt, r + 6, 2);
+    if (usaCnt < 2 || usaOff + 2u * usaCnt > recSize) return;
+    uint16_t check; memcpy(&check, r + usaOff, 2);
+    for (uint32_t k = 1; k < usaCnt; ++k) {
+        uint32_t pos = k * sector - 2; if (pos + 2 > recSize) return;
+        uint16_t v; memcpy(&v, r + pos, 2); if (v != check) return;
+    }
+    for (uint32_t k = 1; k < usaCnt; ++k) { uint32_t pos = k * sector - 2; memcpy(r + pos, r + usaOff + 2 * k, 2); }
+}
 
 // 在一条记录中找无名 $DATA；回调 (resident, attrPtr, attrLen)
 template <class F> void ForEachAttr(const uint8_t* r, uint32_t recSize, F&& f) {
@@ -168,26 +183,78 @@ template <class F> void ForEachAttr(const uint8_t* r, uint32_t recSize, F&& f) {
 }
 } // namespace
 
-bool MftIndexer::LookupRecord(HANDLE vol, uint32_t recSize, uint64_t frn, uint64_t& size, uint64_t& mtime) {
-    std::vector<uint8_t> rec;
-    if (!GetRecord(vol, recSize, frn, rec, nullptr)) return false;
-    uint16_t seq; memcpy(&seq, rec.data() + 0x10, 2);
-    if (seq != static_cast<uint16_t>(frn >> 48)) return false;   // 完整 64 位身份
-    TryFixup(rec, 512);
-    bool any = false;
+MftIndexer::Geometry MftIndexer::GetGeometry(HANDLE vol) {
+    Geometry g;
+    NTFS_VOLUME_DATA_BUFFER nv{}; DWORD got = 0;
+    if (DeviceIoControl(vol, FSCTL_GET_NTFS_VOLUME_DATA, nullptr, 0, &nv, sizeof(nv), &got, nullptr)) {
+        g.recSize = nv.BytesPerFileRecordSegment; g.cluster = nv.BytesPerCluster; g.sector = nv.BytesPerSector;
+    }
+    return g;
+}
+
+// 在一条（已修正的）记录里取 SI 修改时间、无名 $DATA（lowVcn 0）大小、以及属性列表内容
+static void ParseForSize(HANDLE vol, const MftIndexer::Geometry& g, const std::vector<uint8_t>& rec, LookupResult& out, std::vector<uint8_t>* alist) {
     ForEachAttr(rec.data(), static_cast<uint32_t>(rec.size()), [&](uint32_t type, const uint8_t* a, uint32_t alen) {
         uint8_t nonres = a[8], anl = a[9];
         if (!nonres) {
             uint32_t vl; uint16_t vo; memcpy(&vl, a + 0x10, 4); memcpy(&vo, a + 0x14, 2);
             if (vo + vl > alen) return;
-            if (type == 0x10 && vl >= 16) { memcpy(&mtime, a + vo + 8, 8); any = true; }
-            else if (type == 0x80 && anl == 0) { size = vl; any = true; }
+            if (type == 0x10 && vl >= 16) { memcpy(&out.mtime, a + vo + 8, 8); out.timeOk = 1; }
+            else if (type == 0x80 && anl == 0 && !out.sizeOk) { out.size = vl; out.sizeOk = 1; }
+            else if (type == 0x20 && alist) alist->assign(a + vo, a + vo + vl);
         } else if (type == 0x80 && anl == 0 && alen >= 0x38) {
             uint64_t lowVcn; memcpy(&lowVcn, a + 0x10, 8);
-            if (lowVcn == 0) { memcpy(&size, a + 0x30, 8); any = true; }
+            if (lowVcn == 0) { memcpy(&out.size, a + 0x30, 8); out.sizeOk = 1; }
+        } else if (type == 0x20 && alist && alen >= 0x38) {   // 非常驻属性列表：读取其簇
+            std::vector<Run> lr; uint16_t ro; memcpy(&ro, a + 0x20, 2); uint64_t dsz; memcpy(&dsz, a + 0x30, 8);
+            if (!ParseRuns(a + ro, a + alen, lr) || dsz > (1u << 20)) return;
+            std::vector<uint8_t> tmp;
+            for (auto& r : lr) {
+                if (r.sparse) break;
+                size_t at = tmp.size(); tmp.resize(at + static_cast<size_t>(r.len) * g.cluster);
+                OVERLAPPED ov{}; int64_t off = r.lcn * g.cluster; ov.Offset = static_cast<DWORD>(off); ov.OffsetHigh = static_cast<DWORD>(off >> 32);
+                DWORD rd = 0;
+                if (!ReadFile(vol, tmp.data() + at, static_cast<DWORD>(r.len * g.cluster), &rd, &ov)) { tmp.clear(); break; }
+            }
+            if (tmp.size() >= dsz) { tmp.resize(static_cast<size_t>(dsz)); alist->swap(tmp); }
         }
     });
-    return any;
+}
+
+LookupResult MftIndexer::LookupRecord(HANDLE vol, const Geometry& g, uint64_t frn) {
+    LookupResult out;
+    std::vector<uint8_t> rec;
+    if (!GetRecord(vol, g.recSize, frn, rec, nullptr)) return out;
+    uint16_t seq; memcpy(&seq, rec.data() + 0x10, 2);
+    if (seq != static_cast<uint16_t>(frn >> 48)) return out;   // 完整 64 位身份
+    FixupIfNeeded(rec, g.sector);
+    uint64_t baseRef; memcpy(&baseRef, rec.data() + 0x20, 8);
+    if (baseRef & kRecMask) {   // 拿到的是扩展记录：改用基记录重试
+        if (!GetRecord(vol, g.recSize, baseRef, rec, nullptr)) return out;
+        FixupIfNeeded(rec, g.sector);
+    }
+    std::vector<uint8_t> alist;
+    ParseForSize(vol, g, rec, out, &alist);
+    if (!out.sizeOk && !alist.empty()) {
+        // 基记录只有属性列表：跟随 $ATTRIBUTE_LIST 读取 $DATA 所在的扩展记录（先 lowVcn 0，再任意 $DATA 段）
+        std::vector<uint64_t> segs, any;
+        for (size_t o = 0; o + 0x1A <= alist.size();) {
+            uint32_t type; uint16_t rl; memcpy(&type, alist.data() + o, 4); memcpy(&rl, alist.data() + o + 4, 2);
+            if (rl < 0x1A || o + rl > alist.size()) break;
+            uint8_t nl = alist[o + 6]; uint64_t lowVcn, seg; memcpy(&lowVcn, alist.data() + o + 8, 8); memcpy(&seg, alist.data() + o + 0x10, 8);
+            if (type == 0x80 && nl == 0) (lowVcn == 0 ? segs : any).push_back(seg);
+            o += rl;
+        }
+        segs.insert(segs.end(), any.begin(), any.end());
+        for (uint64_t seg : segs) {
+            std::vector<uint8_t> ext;
+            if (!GetRecord(vol, g.recSize, seg, ext, nullptr)) continue;
+            FixupIfNeeded(ext, g.sector);
+            LookupResult r2; ParseForSize(vol, g, ext, r2, nullptr);
+            if (r2.sizeOk) { out.size = r2.size; out.sizeOk = 1; break; }
+        }
+    }
+    return out;
 }
 
 bool MftIndexer::Build(VolumeData& v, bool enableUsn, std::atomic<bool>& stop, std::atomic<size_t>& progress, std::wstring& err) {
@@ -255,7 +322,7 @@ bool MftIndexer::Build(VolumeData& v, bool enableUsn, std::atomic<bool>& stop, s
             Log(L"%s: process extended MFT file record %I64u", v.info.root.c_str(), no);
             std::vector<uint8_t> rec;
             if (!GetRecord(vol, recSize, no, rec, nullptr)) { Log(L"%s: 读取 $MFT 扩展记录 %I64u 失败（%lu）", v.info.root.c_str(), no, GetLastError()); continue; }
-            TryFixup(rec, sector);
+            FixupIfNeeded(rec, sector);
             uint64_t baseRef; memcpy(&baseRef, rec.data() + 0x20, 8);
             if ((baseRef & kRecMask) != 0) { Log(L"%s: extended fragmented file record missing base file record with attribute list（记录 %I64u 基记录 %016I64x）", v.info.root.c_str(), no, baseRef); continue; }
             ForEachAttr(rec.data(), static_cast<uint32_t>(rec.size()), [&](uint32_t type, const uint8_t* a, uint32_t alen) {
@@ -376,16 +443,19 @@ bool MftIndexer::Build(VolumeData& v, bool enableUsn, std::atomic<bool>& stop, s
     return true;
 }
 
-void MftIndexer::EnumerateWithIds(VolumeData& v, const std::vector<std::wstring>& excludes, std::atomic<bool>& stop, std::atomic<size_t>& progress) {
+void MftIndexer::EnumerateWithIds(VolumeData& v, const std::vector<std::wstring>& excludes, std::atomic<bool>& stop, std::atomic<size_t>& progress, const std::wstring& start) {
     v.entries.clear(); v.names.clear(); v.frn.clear();
-    HANDLE rh = OpenRoot(v.info.root);
+    std::wstring top = start.empty() ? v.info.root : start;
+    while (top.size() > 2 && top.back() == L'\\') top.pop_back();
+    HANDLE rh = CreateFileW((top + L"\\").c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     BY_HANDLE_FILE_INFORMATION bi{};
     uint64_t rootFrn = 0;
     if (rh != INVALID_HANDLE_VALUE) { if (GetFileInformationByHandle(rh, &bi)) rootFrn = (static_cast<uint64_t>(bi.nFileIndexHigh) << 32) | bi.nFileIndexLow; CloseHandle(rh); }
-    v.Add(v.info.root.c_str(), v.info.root.size(), kNoParent, kFlagDir, 0, 0);
+    std::wstring_view topName = top.size() <= 2 ? std::wstring_view(top) : std::wstring_view(top).substr(top.rfind(L'\\') + 1);
+    v.Add(topName.data(), topName.size(), kNoParent, kFlagDir, 0, 0);
     v.frn.push_back(rootFrn);
     struct P { uint32_t idx; std::wstring path; };
-    std::vector<P> stack{{0, v.info.root}};
+    std::vector<P> stack{{0, top}};
     std::vector<uint8_t> buf(256 << 10);
     while (!stack.empty() && !stop) {
         P cur = std::move(stack.back()); stack.pop_back();

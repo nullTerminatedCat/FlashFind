@@ -21,12 +21,15 @@ public:
     // 查询 Journal；不存在且 create=true 时尝试创建（需管理员），失败记录 "Failed to create USN Journal"
     static bool QueryJournal(const std::wstring& root, bool create, uint64_t& journalId, int64_t& firstUsn, int64_t& nextUsn, std::wstring& err);
     // 从 from 读到当前末尾（特权）；from 更新为新游标。返回 0 或 Win32 错误（Journal 丢失/过期返回 ERROR_JOURNAL_ENTRY_DELETED 等）
-    static DWORD ReadUsn(HANDLE vol, uint64_t journalId, int64_t& from, std::vector<UsnEvent>& out, std::wstring& err);
-    // 单条记录查询：$DATA 大小与 $STANDARD_INFORMATION 修改时间（序列号不符返回 false）
-    static bool LookupRecord(HANDLE vol, uint32_t recSize, uint64_t frn, uint64_t& size, uint64_t& mtime);
+    // 原始 USN_RECORD_V2 字节（去掉每次返回开头的 8 字节 next USN），由调用方 ParseUsnRecords
+    static DWORD ReadUsnRaw(HANDLE vol, uint64_t journalId, int64_t& from, std::vector<uint8_t>& raw);
+    struct Geometry { uint32_t recSize = 1024, cluster = 4096, sector = 512; };
+    static Geometry GetGeometry(HANDLE vol);
+    // 单条记录查询：$DATA 大小与 SI 修改时间；基记录只有属性列表时跟随扩展记录；序列号不符则全部失败
+    static LookupResult LookupRecord(HANDLE vol, const Geometry& g, uint64_t frn);
     static bool Build(VolumeData& v, bool enableUsn, std::atomic<bool>& stop, std::atomic<size_t>& progress, std::wstring& err);
-    // 带 FileId 的目录枚举，仅用于非 NTFS 文件夹索引
-    static void EnumerateWithIds(VolumeData& v, const std::vector<std::wstring>& excludes, std::atomic<bool>& stop, std::atomic<size_t>& progress);
+    // 带 FileId 的目录枚举：非 NTFS 文件夹索引；以及移入文件夹的扫描（start = 该目录，entries[0] 为它本身）
+    static void EnumerateWithIds(VolumeData& v, const std::vector<std::wstring>& excludes, std::atomic<bool>& stop, std::atomic<size_t>& progress, const std::wstring& start = L"");
 };
 
 } // namespace ff

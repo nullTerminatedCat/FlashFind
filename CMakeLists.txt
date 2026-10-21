@@ -22,7 +22,7 @@ add_executable(FlashFind WIN32
     src/Hotkey.cpp src/Hotkey.h
     src/Dpi.h
     src/Util.h
-    src/ServiceClient.cpp src/ServiceClient.h
+    src/NtfsSource.cpp src/NtfsSource.h src/Service.cpp
     src/MftIndexer.cpp
     src/Usn.cpp src/Usn.h
     resources/FlashFind.rc
@@ -34,4 +34,4 @@ if(MSVC)
     target_compile_options(FlashFind PRIVATE /utf-8 /W4 /permissive- /MP)
     target_link_options(FlashFind PRIVATE /MANIFEST:NO)  # 使用 rc 内嵌的 app.manifest
 endif()
-target_link_libraries(FlashFind PRIVATE comctl32 uxtheme dwmapi shell32 shlwapi ole32 d2d1 dwrite cabinet psapi)
+target_link_libraries(FlashFind PRIVATE comctl32 uxtheme dwmapi shell32 shlwapi ole32 d2d1 dwrite cabinet psapi advapi32)

@@ -15,6 +15,7 @@
 
 namespace ff {
 
+class NtfsSource;
 constexpr uint32_t kNoParent = 0xFFFFFFFFu;
 
 // 每个对象 32 字节。名称只存一份原始 UTF-16，无逐文件堆分配。
@@ -157,6 +158,8 @@ struct VolumeData {
 };
 
 std::shared_ptr<IndexData> Merge(std::vector<VolumeData>& vols, uint64_t configHash);   // 建立时：整体排序
+// 清除幽灵（已删除）条目：压缩条目/名称/FRN，byName 只重映射下标、不重新排序
+std::shared_ptr<IndexData> ClearGhosts(const IndexData& d, size_t* cleared);
 VolumeData ExtractVolume(const IndexData& d, uint32_t vol);
 uint64_t ConfigHash(const std::vector<std::wstring>& excludes, const std::vector<VolumeConfig>& vols);
 bool PathUnder(std::wstring_view path, std::wstring_view dir);   // 不区分大小写；path == dir 也算
@@ -172,6 +175,9 @@ struct IndexStats {
     std::wstring note;          // 需要提示用户的信息（例如需要管理员/服务）
     size_t usnChanges = 0;
     bool headerOnlyUpdate = false, fullSave = false;
+    bool needService = false;   // 有 NTFS 卷因没有服务/管理员而无法索引或更新
+    std::wstring source;        // 特权来源：本进程（管理员）/ FlashFind 服务 / 空
+    size_t ghostsCleared = 0;
 };
 
 class Indexer {
@@ -185,6 +191,7 @@ public:
         bool forceRebuild = false;
         bool monitor = true;            // 总开关；每卷另有 monitor
         int monitorDelayMs = 1000;      // monitor_update_delay：批量合并间隔
+        bool allowConsoleService = false;   // 仅自检：允许连接 -svc-console 管道服务器
         const VolumeConfig* Vol(const std::wstring& root) const;
     };
     void Start(HWND notifyHwnd, Options opt);
@@ -216,6 +223,7 @@ private:
     std::wstring current_;
     IndexStats stats_;
     std::wstring adminVols_;
+    NtfsSource* src_ = nullptr;   // 仅索引线程使用
     HWND hwnd_ = nullptr;
 };
 
