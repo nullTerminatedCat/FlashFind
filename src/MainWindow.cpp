@@ -483,18 +483,71 @@ void MainWindow::ShowProperties() {
 }
 
 void MainWindow::ContextMenu(POINT pt) {
-    // TODO(M2): 合并系统 IContextMenu（发送到、7-Zip 等），自定义动词
     if (list_.SelectedCount() == 0) return;
+    // 系统右键菜单（IContextMenu）：同一文件夹内的选择；顶部插入闪寻自己的命令
+    constexpr UINT kFirst = 0x8000, kLast = 0xEFFF;
+    auto sel = list_.Selection();
+    const auto* res = list_.Results();
+    IContextMenu* cm = nullptr;
+    if (res && res->data && sel.size() <= 4096) {
+        const auto& d = *res->data;
+        uint32_t parent = d.entries[sel[0]].parent;
+        bool same = std::all_of(sel.begin(), sel.end(), [&](uint32_t i) { return d.entries[i].parent == parent; });
+        if (same) {
+            std::vector<PIDLIST_ABSOLUTE> abs;
+            for (uint32_t i : sel) {
+                PIDLIST_ABSOLUTE p = nullptr;
+                if (SUCCEEDED(SHParseDisplayName(d.FullPath(i).c_str(), nullptr, &p, 0, nullptr)) && p) abs.push_back(p);
+            }
+            if (abs.size() == sel.size()) {
+                IShellFolder* folder = nullptr; PCUITEMID_CHILD child = nullptr;
+                if (SUCCEEDED(SHBindToParent(abs[0], IID_PPV_ARGS(&folder), &child))) {
+                    std::vector<PCUITEMID_CHILD> kids;
+                    for (auto p : abs) kids.push_back(ILFindLastID(p));
+                    folder->GetUIObjectOf(hwnd_, static_cast<UINT>(kids.size()), kids.data(), IID_IContextMenu, nullptr, reinterpret_cast<void**>(&cm));
+                    folder->Release();
+                }
+            }
+            for (auto p : abs) CoTaskMemFree(p);
+        }
+    }
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, IDM_OPEN, L"打开(&O)\tEnter");
+    if (!cm) {
+        AppendMenuW(m, MF_STRING, IDM_OPEN, L"打开(&O)\tEnter");
+    }
     AppendMenuW(m, MF_STRING, IDM_OPEN_PATH, L"打开路径(&P)\tCtrl+Enter");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_COPY_PATH, L"复制完整路径(&C)\tCtrl+Shift+C");
     AppendMenuW(m, MF_STRING, IDM_COPY_NAME, L"复制名称(&N)");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, IDM_PROPERTIES, L"属性(&R)\tAlt+Enter");
-    SetMenuDefaultItem(m, IDM_OPEN, FALSE);
-    TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd_, nullptr);
+    if (cm) {
+        UINT flags = CMF_NORMAL | ((GetKeyState(VK_SHIFT) < 0) ? CMF_EXTENDEDVERBS : 0);
+        if (FAILED(cm->QueryContextMenu(m, GetMenuItemCount(m), kFirst, kLast, flags))) { cm->Release(); cm = nullptr; }
+    }
+    if (!cm) {
+        AppendMenuW(m, MF_STRING, IDM_PROPERTIES, L"属性(&R)\tAlt+Enter");
+        SetMenuDefaultItem(m, IDM_OPEN, FALSE);
+    }
+    if (cm) { cm->QueryInterface(IID_PPV_ARGS(&cm3_)); if (!cm3_) cm->QueryInterface(IID_PPV_ARGS(&cm2_)); }
+    UINT cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd_, nullptr);
+    if (cm3_) { cm3_->Release(); cm3_ = nullptr; }
+    if (cm2_) { cm2_->Release(); cm2_ = nullptr; }
+    if (cmd >= kFirst && cmd <= kLast && cm) {
+        char verb[64] = {};
+        bool skip = SUCCEEDED(cm->GetCommandString(cmd - kFirst, GCS_VERBA, nullptr, verb, sizeof(verb))) && _stricmp(verb, "rename") == 0;   // 无就地编辑：忽略“重命名”
+        if (!skip) {
+            CMINVOKECOMMANDINFOEX ci{sizeof(ci)};
+            ci.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE | (GetKeyState(VK_CONTROL) < 0 ? CMIC_MASK_CONTROL_DOWN : 0) | (GetKeyState(VK_SHIFT) < 0 ? CMIC_MASK_SHIFT_DOWN : 0);
+            ci.hwnd = hwnd_;
+            ci.lpVerb = MAKEINTRESOURCEA(cmd - kFirst);
+            ci.lpVerbW = MAKEINTRESOURCEW(cmd - kFirst);
+            ci.nShow = SW_SHOWNORMAL;
+            ci.ptInvoke = pt;
+            cm->InvokeCommand(reinterpret_cast<CMINVOKECOMMANDINFO*>(&ci));
+        }
+    } else if (cmd) {
+        PostMessageW(hwnd_, WM_COMMAND, cmd, 0);
+    }
+    if (cm) cm->Release();
     DestroyMenu(m);
 }
 
@@ -574,6 +627,12 @@ bool MainWindow::PreTranslate(MSG& msg) {
 
 // ---------- 消息 ----------
 LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
+    // 系统右键菜单的子菜单（发送到、打开方式等）需要这些消息
+    if ((cm3_ || cm2_) && (m == WM_INITMENUPOPUP || m == WM_DRAWITEM || m == WM_MEASUREITEM || m == WM_MENUCHAR)) {
+        LRESULT r = 0;
+        if (cm3_ && SUCCEEDED(cm3_->HandleMenuMsg2(m, w, l, &r))) return r;
+        if (cm2_ && SUCCEEDED(cm2_->HandleMenuMsg(m, w, l))) return m == WM_INITMENUPOPUP ? 0 : TRUE;
+    }
     if (m == taskbarCreated_ && taskbarCreated_) { tray_.Add(hwnd_, iconSmall_); return 0; }
     switch (m) {
     case WM_CREATE: OnCreate(); return 0;

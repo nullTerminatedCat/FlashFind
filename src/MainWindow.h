@@ -6,6 +6,7 @@
 #include "Search.h"
 #include "Tray.h"
 #include <memory>
+#include <shlobj.h>
 
 namespace ff {
 
@@ -43,6 +44,8 @@ private:
 
     HWND hwnd_ = nullptr, edit_ = nullptr, svcBtn_ = nullptr, filter_ = nullptr;
     HBITMAP shieldBmp_ = nullptr;
+    IContextMenu2* cm2_ = nullptr;
+    IContextMenu3* cm3_ = nullptr;
     int svcBtnW_ = 0;
     ResultList list_;
     Indexer indexer_;
