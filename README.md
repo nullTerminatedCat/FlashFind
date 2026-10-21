@@ -81,3 +81,31 @@ docs/                     UI 设计、原型
 - 普通文件按扩展名取图标（exe/lnk 无专属图标）。
 - 只能按名称排序；无过滤器、书签、高级搜索、选项对话框。
 - 菜单栏在深色模式下仍为浅色（Win32 限制，计划 M2 处理）。
+
+## FlashFind 索引服务
+
+读取 NTFS 主文件表和带文件名的 USN 记录需要管理员权限。闪寻可安装一个 LocalSystem 服务（`FlashFind.exe -svc`），只负责特权读取，索引、排序与数据库仍在普通权限的界面进程中：
+
+- 程序内：**工具 → 安装 / 卸载 FlashFind 服务…**，或状态栏盾牌按钮（触发 UAC，完成后无需重启）。
+- 命令行（管理员）：`FlashFind.exe -install-service` / `FlashFind.exe -uninstall-service`。
+- 服务日志：`%ProgramData%\FlashFind\FlashFind-service.log`。
+
+## 自检
+
+```powershell
+ctest --test-dir build\Release --output-on-failure   # -initest、-incrtest（无数据库时使用合成的 226 万对象）
+FlashFind.exe -pipetest G:                            # 启动 -svc-console 测试管道协议（需要 NTFS 卷）
+```
+
+## 发布
+
+推送 `v*` 标签后，GitHub Actions（`.github/workflows/release.yml`）会构建、运行自检、用 `scripts/package.ps1` 打包（Inno Setup 安装包 + 便携版 zip + SHA256SUMS），并以 `docs/RELEASE_<版本>.md` 为说明发布 Release。本地打包：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1
+powershell -ExecutionPolicy Bypass -File scripts\package.ps1 -BuildDirectory build\Release
+```
+
+## 许可
+
+MIT，见 [LICENSE](LICENSE)。

@@ -1,0 +1,39 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Self tests (non-admin)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Collect artifact
+        shell: pwsh
+        run: |
+          $out = "dist/FlashFind-windows-x64"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item build/FlashFind.exe, LICENSE, README.md $out
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: FlashFind-windows-x64
+          path: dist/FlashFind-windows-x64

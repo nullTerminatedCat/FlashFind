@@ -35,3 +35,8 @@ if(MSVC)
     target_link_options(FlashFind PRIVATE /MANIFEST:NO)  # 使用 rc 内嵌的 app.manifest
 endif()
 target_link_libraries(FlashFind PRIVATE comctl32 uxtheme dwmapi shell32 shlwapi ole32 d2d1 dwrite cabinet psapi advapi32)
+
+# 非管理员自检（-pipetest 需要 NTFS 卷，不纳入 ctest）
+enable_testing()
+add_test(NAME initest COMMAND FlashFind -initest)
+add_test(NAME incrtest COMMAND FlashFind -incrtest)
