@@ -32,6 +32,14 @@ static void WriteOut(const std::wstring& name, const std::wstring& out) {
     DWORD wr; WriteFile(f, "\xFF\xFE", 2, &wr, nullptr);
     WriteFile(f, out.data(), static_cast<DWORD>(out.size() * 2), &wr, nullptr);
     CloseHandle(f);
+    // 同时输出到 stdout（ctest / CI 日志可见）
+    HANDLE so = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (so && so != INVALID_HANDLE_VALUE) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, out.data(), static_cast<int>(out.size()), nullptr, 0, nullptr, nullptr);
+        std::string u(n, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, out.data(), static_cast<int>(out.size()), u.data(), n, nullptr, nullptr);
+        WriteFile(so, u.data(), static_cast<DWORD>(u.size()), &wr, nullptr);
+    }
 }
 
 static size_t CountExact(const IndexData& d, std::wstring_view nm) {
@@ -59,7 +67,8 @@ static std::shared_ptr<IndexData> Synthesize(size_t n) {
     for (size_t i = 1; i < n; ++i) {
         x ^= x << 13; x ^= x >> 7; x ^= x << 17;
         bool dir = (x & 7) == 0;
-        uint32_t parent = dirs[(x >> 8) % dirs.size()];
+        // 1/16 的对象挂在前 64 个文件夹下：形成数百~数千子项的大目录（与真实磁盘相似，便于选取测试目标）
+        uint32_t parent = ((x >> 40) & 15) == 0 ? dirs[(x >> 8) % std::min<size_t>(dirs.size(), 64)] : dirs[(x >> 8) % dirs.size()];
         int len = swprintf_s(nm, L"%s_%llx%s", dir ? L"folder" : L"file", (unsigned long long)(x >> 20) & 0xFFFFFF, dir ? L"" : L".txt");
         uint32_t idx = v.Add(nm, len, parent, dir ? kFlagDir : 0, dir ? 0 : (x & 0xFFFFF), 0);
         if (dir) dirs.push_back(idx);
@@ -109,7 +118,7 @@ static int IncrTest(std::wstring dbPath) {
     auto isUnder = [&](uint32_t i, uint32_t anc) { for (uint32_t p = B.entries[i].parent; p != kNoParent; p = B.entries[p].parent) if (p == anc) return true; return false; };
     // 改名/删除目标：不在 S、X 之下，取均匀分布的文件
     std::vector<uint32_t> pick;
-    for (size_t k = 0; k < files.size() && pick.size() < 550; k += std::max<size_t>(1, files.size() / 600))
+    for (size_t k = 0; k < files.size() && pick.size() < 550; k += std::max<size_t>(1, files.size() / 6000))
         if (!isUnder(files[k], S) && !isUnder(files[k], X) && files[k] != D0) pick.push_back(files[k]);
     if (D0 == kNoParent || S == kNoParent || X == kNoParent || pick.size() < 550) { out += L"[FAIL] 找不到测试目标\r\n"; WriteOut(L"ff_incrtest.txt", out); return 1; }
     size_t subDirs = 0, subFiles = 0;
