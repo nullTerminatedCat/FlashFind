@@ -502,6 +502,37 @@ static int WildTest(std::wstring dbPath) {
     return fails ? 1 : 0;
 }
 
+// -sorttest [db]：列排序正确性与耗时
+static int SortTest(std::wstring dbPath) {
+    std::wstring out; wchar_t buf[1024]; int fails = 0;
+    std::wstring err; if (dbPath.empty()) dbPath = Indexer::DefaultDbPath();
+    auto d = LoadDb(dbPath, err);
+    if (!d) { out += L"[db] 无数据库，改用合成索引\r\n"; d = Synthesize(2260000); }
+    for (size_t i = 0; i < d->entries.size(); i += 7) d->entries.Mut(i).mtime = 133000000000000000ULL + (i * 2654435761ULL) % 100000000000ULL;   // 合成库时间全 0：打散
+    swprintf_s(buf, L"[db] %zu 个对象\r\n", d->entries.size()); out += buf;
+    double t0 = NowMs(); auto rank = BuildFolderPathRank(*d); double rankMs = NowMs() - t0;
+    swprintf_s(buf, L"[path-rank] 文件夹路径先序排名 %.1f ms\r\n", rankMs); out += buf;
+    const wchar_t* cn[] = {L"名称", L"路径", L"大小", L"时间"};
+    for (const wchar_t* q : {L"", L"exe", L"*.dll"}) {
+        std::vector<uint32_t> base; SearchCore(*d, ParseTerms(q), base, [] { return false; });
+        for (int c = 0; c < 4; ++c) for (int desc = 0; desc < 2; ++desc) {
+            SortSpec so{static_cast<SortCol>(c), desc != 0};
+            std::vector<uint32_t> it; double best = 1e9;
+            for (int k = 0; k < 3; ++k) { it = base; double a = NowMs(); SortItems(*d, it, so, &rank); best = std::min(best, NowMs() - a); }
+            bool ok = it.size() == base.size();
+            auto key = [&](uint32_t i) -> uint64_t { const Entry& e = d->entries[i];
+                return c == 2 ? (e.IsDir() ? 0 : e.size + 1) : c == 3 ? e.mtime : (e.parent == kNoParent ? 0 : rank[e.parent]); };
+            for (size_t k = 1; k < it.size() && ok && c > 0; ++k) { uint64_t a = key(it[k - 1]), b = key(it[k]); if (desc ? a < b : a > b) ok = false; }
+            if (c == 0) ok = ok && (desc ? std::equal(it.begin(), it.end(), base.rbegin()) : it == base);
+            swprintf_s(buf, L"  %s %-6s %s %s results=%-8zu sort=%7.2f ms\r\n", ok ? L"[OK]  " : L"[FAIL]", q[0] ? q : L"(全部)", cn[c], desc ? L"降" : L"升", it.size(), best); out += buf;
+            if (!ok) ++fails;
+        }
+    }
+    swprintf_s(buf, L"[result] %s (%d failed)\r\n", fails ? L"FAIL" : L"PASS", fails); out += buf;
+    WriteOut(L"ff_sorttest.txt", out);
+    return fails ? 1 : 0;
+}
+
 // -pipetest：启动 -svc-console（非服务的同一管道服务器），通过管道测试协议
 static int PipeTest(std::wstring vol) {
     std::wstring out; wchar_t buf[2048]; int fails = 0;
@@ -605,6 +636,7 @@ int App::Run(HINSTANCE inst, int show) {
         if (mode == L"-svc-console") return SvcConsole();
         if (mode == L"-install-service") return InstallService();
         if (mode == L"-uninstall-service") return UninstallService();
+        if (mode == L"-sorttest") { InitFold(); g_fastAscii = true; return SortTest(arg); }
         if (mode == L"-wildtest") { InitFold(); g_fastAscii = true; return WildTest(arg); }
         if (mode == L"-pipetest") { InitFold(); g_fastAscii = true; return PipeTest(arg.empty() ? L"G:" : arg); }
         if (mode == L"-incrtest" || mode == L"-initest" || mode == L"-gtest") {

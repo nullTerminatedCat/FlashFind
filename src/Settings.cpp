@@ -1,4 +1,5 @@
 #include "Settings.h"
+#include <algorithm>
 #include <windows.h>
 #include <shlobj.h>
 #include <sstream>
@@ -104,6 +105,8 @@ void Settings::LoadFrom(const std::wstring& ini, bool detect) {
     colPath = ReadInt(ini, L"columns", L"path", colPath);
     colSize = ReadInt(ini, L"columns", L"size", colSize);
     colDate = ReadInt(ini, L"columns", L"date_modified", colDate);
+    sortCol = std::clamp(ReadInt(ini, L"columns", L"sort", 0), 0, 3);
+    sortDesc = ReadInt(ini, L"columns", L"sort_ascending", 1) == 0;
     escHides = ReadInt(ini, L"behavior", L"esc_hides_window", 1) != 0;
     closeToTray = ReadInt(ini, L"behavior", L"close_to_tray", 1) != 0;
     selectAllOnShow = ReadInt(ini, L"behavior", L"select_all_on_show", 1) != 0;
@@ -150,6 +153,7 @@ void Settings::SaveTo(const std::wstring& ini) const {
     WriteInt(ini, L"window", L"maximized", maximized);
     WriteInt(ini, L"columns", L"name", colName); WriteInt(ini, L"columns", L"path", colPath);
     WriteInt(ini, L"columns", L"size", colSize); WriteInt(ini, L"columns", L"date_modified", colDate);
+    WriteInt(ini, L"columns", L"sort", sortCol); WriteInt(ini, L"columns", L"sort_ascending", !sortDesc);
     WriteInt(ini, L"behavior", L"esc_hides_window", escHides);
     WriteInt(ini, L"behavior", L"close_to_tray", closeToTray);
     WriteInt(ini, L"behavior", L"select_all_on_show", selectAllOnShow);

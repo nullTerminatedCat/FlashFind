@@ -4,6 +4,7 @@
 #include "Settings.h"
 #include "Theme.h"
 #include "Util.h"
+#include "App.h"
 #include <shellapi.h>
 #include <uxtheme.h>
 #include <algorithm>
@@ -34,13 +35,21 @@ HWND ResultList::Create(HWND parent, int id) {
         c.fmt = cols[i].fmt;
         ListView_InsertColumn(hwnd_, i, &c);
     }
-    HWND hdr = ListView_GetHeader(hwnd_);
-    HDITEMW hi{HDI_FORMAT};
-    Header_GetItem(hdr, 0, &hi);
-    hi.fmt |= HDF_SORTUP;
-    Header_SetItem(hdr, 0, &hi);
+    SetSort({static_cast<SortCol>(s.sortCol), s.sortDesc});
     ApplyTheme();
     return hwnd_;
+}
+
+void ResultList::SetSort(SortSpec s) {
+    sort_ = s;
+    HWND hdr = ListView_GetHeader(hwnd_);
+    for (int c = 0; c < ColCount; ++c) {
+        HDITEMW hi{HDI_FORMAT};
+        Header_GetItem(hdr, c, &hi);
+        hi.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
+        if (c == static_cast<int>(s.col)) hi.fmt |= s.desc ? HDF_SORTDOWN : HDF_SORTUP;
+        Header_SetItem(hdr, c, &hi);
+    }
 }
 
 ResultList::~ResultList() {
@@ -280,6 +289,17 @@ bool ResultList::OnNotify(NMHDR* nm, LRESULT* out) {
             case ColDate: FormatTimeInto(d.entries[i].mtime, o, cap); break;
             }
         }
+        return true;
+    }
+    case LVN_COLUMNCLICK: {   // 同列切换升/降序；新列：名称/路径升序，大小/时间降序
+        auto* lv = reinterpret_cast<NMLISTVIEW*>(nm);
+        SortCol c = static_cast<SortCol>(lv->iSubItem);
+        SortSpec s = sort_;
+        if (s.col == c) s.desc = !s.desc; else { s.col = c; s.desc = c == SortCol::Size || c == SortCol::Date; }
+        SetSort(s);
+        auto& st = GetSettings(); st.sortCol = static_cast<int>(s.col); st.sortDesc = s.desc;
+        PostMessageW(GetParent(hwnd_), WM_APP_SORT, 0, 0);
+        *out = 0;
         return true;
     }
     case LVN_ODFINDITEMW: {   // 键入跳转：名称前缀（折叠比较）

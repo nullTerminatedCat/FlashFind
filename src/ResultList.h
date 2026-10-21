@@ -16,6 +16,8 @@ public:
     void SetResults(std::shared_ptr<SearchResult> r);
     const SearchResult* Results() const { return res_.get(); }
     void ApplyTheme();
+    SortSpec Sort() const { return sort_; }
+    void SetSort(SortSpec s);
     void SetFont(HFONT f, HFONT bold, int rowHeight);
     bool OnNotify(NMHDR* nm, LRESULT* out);
 
@@ -33,6 +35,7 @@ private:
     int IconFor(uint32_t i);
 
     HWND hwnd_ = nullptr;
+    SortSpec sort_;
     std::shared_ptr<SearchResult> res_;
     static constexpr size_t kRowBuf = 4096;
     wchar_t rowBuf_[kRowBuf];

@@ -12,6 +12,7 @@ struct Settings {
     int x = CW_USEDEFAULT_SENTINEL, y = 0, w = 900, h = 600; // 逻辑像素
     bool maximized = false;
     int colName = 260, colPath = 380, colSize = 90, colDate = 140;
+    int sortCol = 0; bool sortDesc = false;   // [columns] sort / sort_ascending
     // 行为
     bool escHides = true;
     bool closeToTray = true;

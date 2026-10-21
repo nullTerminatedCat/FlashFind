@@ -303,7 +303,7 @@ void MainWindow::RunSearch() {
     int len = GetWindowTextLengthW(edit_);
     std::wstring q(static_cast<size_t>(len), L'\0');
     if (len) GetWindowTextW(edit_, q.data(), len + 1);
-    searcher_->Request(q, std::move(snap));
+    searcher_->Request(q, std::move(snap), list_.Sort());
 }
 
 void MainWindow::UpdateTitle() {
@@ -621,6 +621,7 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_APP_TOGGLE: Toggle(); return 0;
     case WM_APP_SHOW: ShowAndFocus(); return 0;
+    case WM_APP_SORT: RunSearch(); return 0;
     case WM_APP_TRAY:
         switch (LOWORD(l)) {
         case WM_LBUTTONUP: case NIN_SELECT: case NIN_KEYSELECT: Toggle(); break;
