@@ -14,6 +14,12 @@ std::vector<uint32_t> BuildFolderPathRank(const IndexData& d);
 // items 须为名称顺序（SearchCore 的输出）；按列排序，同键保持名称顺序。多线程分块排序 + 归并。
 void SortItems(const IndexData& d, std::vector<uint32_t>& items, SortSpec s, const std::vector<uint32_t>* folderRank);
 
+// 完整搜索语法（| ! < > ext: size: dm: path: file: folder: 通配符）
+struct Query;
+std::shared_ptr<Query> CompileQuery(const std::wstring& text);
+const std::vector<std::wstring>& QueryHighlight(const Query& q);
+bool SearchQuery(const IndexData& d, const Query& q, std::vector<uint32_t>& out, const std::function<bool()>& cancelled);
+
 struct SearchResult {
     uint64_t generation = 0;
     std::shared_ptr<const IndexData> data;

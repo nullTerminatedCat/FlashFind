@@ -533,6 +533,83 @@ static int SortTest(std::wstring dbPath) {
     return fails ? 1 : 0;
 }
 
+// -syntaxtest [db]：搜索语法单元测试 + 大索引耗时
+static uint64_t FtLocal(int y, int m, int d) {
+    SYSTEMTIME lt{}; lt.wYear = (WORD)y; lt.wMonth = (WORD)m; lt.wDay = (WORD)d; lt.wHour = 12; SYSTEMTIME ut; FILETIME ft;
+    TzSpecificLocalTimeToSystemTime(nullptr, &lt, &ut); SystemTimeToFileTime(&ut, &ft);
+    return (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+}
+static int SyntaxTest(std::wstring dbPath) {
+    std::wstring out; wchar_t buf[1024]; int fails = 0;
+    VolumeData v; v.info.root = L"T:"; v.info.ntfs = true;
+    v.Add(L"T:", 2, kNoParent, kFlagDir, 0, 0);
+    auto add = [&](const wchar_t* nm, uint32_t parent, bool dir, uint64_t size, uint64_t mt) { return v.Add(nm, static_cast<uint32_t>(wcslen(nm)), parent, dir ? kFlagDir : 0, size, mt); };
+    SYSTEMTIME now; GetLocalTime(&now);
+    uint64_t today = FtLocal(now.wYear, now.wMonth, now.wDay);
+    uint32_t docs = add(L"Docs", 0, true, 0, today), win = add(L"Windows", 0, true, 0, today);
+    add(L"report.docx", docs, false, 20 << 10, FtLocal(2024, 3, 5));
+    add(L"report.pdf", docs, false, 3 << 20, FtLocal(2024, 7, 1));
+    add(L"notes.txt", docs, false, 0, today);
+    add(L"photo.JPG", docs, false, 200 << 20, FtLocal(2023, 12, 31));
+    add(L"notepad.exe", win, false, 300 << 10, FtLocal(2022, 1, 1));
+    add(L"report", win, true, 0, today);
+    add(L"1setup.exe", win, false, 5 << 20, today);
+    std::vector<VolumeData> vols; vols.push_back(std::move(v));
+    auto d = Merge(vols, 0);
+    auto names = [&](const wchar_t* q) {
+        auto cq = CompileQuery(q); std::vector<uint32_t> r; SearchQuery(*d, *cq, r, [] { return false; });
+        std::vector<std::wstring> n; for (uint32_t i : r) n.emplace_back(d->Name(i)); std::sort(n.begin(), n.end());
+        std::wstring s; for (auto& x : n) { if (!s.empty()) s += L","; s += x; } return s;
+    };
+    auto T = [&](const wchar_t* q, const wchar_t* want) {
+        std::wstring got = names(q); bool ok = got == want;
+        swprintf_s(buf, L"  %s %-34s => %s%s%s\r\n", ok ? L"[OK]  " : L"[FAIL]", q, got.c_str(), ok ? L"" : L"  期望 ", ok ? L"" : want); out += buf;
+        if (!ok) ++fails;
+    };
+    out += L"[unit]\r\n";
+    T(L"report", L"report,report.docx,report.pdf");
+    T(L"report !pdf", L"report,report.docx");
+    T(L"docx|pdf", L"report.docx,report.pdf");
+    T(L"report docx|pdf", L"report.docx,report.pdf");
+    T(L"<docx|pdf> | exe", L"1setup.exe,notepad.exe,report.docx,report.pdf");
+    T(L"!<report|note>", L"1setup.exe,Docs,T:,Windows,photo.JPG");
+    T(L"ext:exe", L"1setup.exe,notepad.exe");
+    T(L"ext:jpg;.PDF", L"photo.JPG,report.pdf");
+    T(L"size:>1mb", L"1setup.exe,photo.JPG,report.pdf");
+    T(L"size:<=20kb", L"notes.txt,report.docx");
+    T(L"size:1mb..10mb", L"1setup.exe,report.pdf");
+    T(L"size:empty", L"notes.txt");
+    T(L"size:gigantic", L"photo.JPG");
+    T(L"dm:today file:", L"1setup.exe,notes.txt");
+    T(L"dm:2024", L"report.docx,report.pdf");
+    T(L"dm:2024-03", L"report.docx");
+    T(L"dm:<2023-01-01", L"T:,notepad.exe");
+    T(L"dm:2023..2024-03-05", L"photo.JPG,report.docx");
+    T(L"folder:", L"Docs,T:,Windows,report");
+    T(L"folder:report", L"report");
+    T(L"file:report", L"report.docx,report.pdf");
+    T(L"path:windows", L"1setup.exe,Windows,notepad.exe,report");
+    T(L"path:docs\\", L"notes.txt,photo.JPG,report.docx,report.pdf");
+    T(L"1*.exe", L"1setup.exe");
+    T(L"\"report.d\"", L"report.docx");
+    T(L"*.exe | *.pdf !1*", L"notepad.exe,report.pdf");
+    T(L"size:abc", L"");
+    InitFold(); g_fastAscii = true;
+    std::wstring err; if (dbPath.empty()) dbPath = Indexer::DefaultDbPath();
+    auto big = LoadDb(dbPath, err);
+    if (!big) { out += L"[db] 无数据库，改用合成索引\r\n"; big = Synthesize(2260000); }
+    swprintf_s(buf, L"[db] %zu 个对象\r\n", big->entries.size()); out += buf;
+    for (const wchar_t* q : {L"exe", L"exe|dll", L"ext:exe", L"ext:exe;dll;sys", L"!exe", L"size:>100mb", L"dm:thisweek", L"file: dm:today",
+                             L"report !<pdf|docx>", L"path:windows ext:dll", L"*.exe size:>1mb"}) {
+        auto cq = CompileQuery(q); std::vector<uint32_t> res; double best = 1e9;
+        for (int k = 0; k < 5; ++k) { double a = NowMs(); SearchQuery(*big, *cq, res, [] { return false; }); best = std::min(best, NowMs() - a); }
+        swprintf_s(buf, L"[search] %-24s results=%-8zu best=%6.2f ms\r\n", q, res.size(), best); out += buf;
+    }
+    swprintf_s(buf, L"[result] %s (%d failed)\r\n", fails ? L"FAIL" : L"PASS", fails); out += buf;
+    WriteOut(L"ff_syntaxtest.txt", out);
+    return fails ? 1 : 0;
+}
+
 // -pipetest：启动 -svc-console（非服务的同一管道服务器），通过管道测试协议
 static int PipeTest(std::wstring vol) {
     std::wstring out; wchar_t buf[2048]; int fails = 0;
@@ -636,6 +713,7 @@ int App::Run(HINSTANCE inst, int show) {
         if (mode == L"-svc-console") return SvcConsole();
         if (mode == L"-install-service") return InstallService();
         if (mode == L"-uninstall-service") return UninstallService();
+        if (mode == L"-syntaxtest") { InitFold(); g_fastAscii = true; return SyntaxTest(arg); }
         if (mode == L"-sorttest") { InitFold(); g_fastAscii = true; return SortTest(arg); }
         if (mode == L"-wildtest") { InitFold(); g_fastAscii = true; return WildTest(arg); }
         if (mode == L"-pipetest") { InitFold(); g_fastAscii = true; return PipeTest(arg.empty() ? L"G:" : arg); }
