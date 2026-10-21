@@ -37,6 +37,7 @@ HWND ResultList::Create(HWND parent, int id) {
         ListView_InsertColumn(hwnd_, i, &c);
     }
     SetSort({static_cast<SortCol>(s.sortCol), s.sortDesc});
+    UpdateHiddenColumns();
     ApplyTheme();
     return hwnd_;
 }
@@ -51,6 +52,58 @@ void ResultList::SetSort(SortSpec s) {
         if (c == static_cast<int>(s.col)) hi.fmt |= s.desc ? HDF_SORTDOWN : HDF_SORTUP;
         Header_SetItem(hdr, c, &hi);
     }
+}
+
+bool ResultList::GetSettingsVisible(int c) { return c <= 0 || c >= ColCount || GetSettings().colVisible[c]; }
+
+// 隐藏列 = 宽度 0 + HDF_FIXEDWIDTH（不可拖宽），绘制时宽度 0 的列自动跳过；记住的宽度保存在设置里
+void ResultList::UpdateHiddenColumns() {
+    HWND hdr = ListView_GetHeader(hwnd_);
+    auto& s = GetSettings();
+    int saved[ColCount] = {s.colName, s.colPath, s.colSize, s.colDate};
+    UINT dpi = DpiOf(hwnd_);
+    for (int c = 1; c < ColCount; ++c) {
+        bool vis = s.colVisible[c];
+        HDITEMW hi{HDI_FORMAT}; Header_GetItem(hdr, c, &hi);
+        hi.fmt = vis ? (hi.fmt & ~HDF_FIXEDWIDTH) : (hi.fmt | HDF_FIXEDWIDTH);
+        Header_SetItem(hdr, c, &hi);
+        int cur = ListView_GetColumnWidth(hwnd_, c);
+        if (!vis && cur != 0) ListView_SetColumnWidth(hwnd_, c, 0);
+        if (vis && cur == 0) ListView_SetColumnWidth(hwnd_, c, Scale(std::max(saved[c], 40), dpi));
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void ResultList::SetColumnVisible(int c, bool v) {
+    if (c <= ColName || c >= ColCount) return;
+    auto& s = GetSettings();
+    if (!v) {   // 记住当前宽度
+        int w = MulDiv(ListView_GetColumnWidth(hwnd_, c), 96, static_cast<int>(DpiOf(hwnd_)));
+        if (w > 0) { if (c == ColPath) s.colPath = w; else if (c == ColSize) s.colSize = w; else s.colDate = w; }
+    }
+    s.colVisible[c] = v;
+    UpdateHiddenColumns();
+}
+
+void ResultList::ColumnMenu(POINT pt) {
+    HMENU m = CreatePopupMenu();
+    const wchar_t* names[] = {L"名称", L"路径", L"大小", L"修改时间"};
+    for (int c = 0; c < ColCount; ++c)
+        AppendMenuW(m, MF_STRING | (ColumnVisible(c) ? MF_CHECKED : 0) | (c == ColName ? MF_GRAYED : 0), 1 + c, names[c]);
+    int cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd_, nullptr);
+    DestroyMenu(m);
+    if (cmd > 1) SetColumnVisible(cmd - 1, !ColumnVisible(cmd - 1));
+}
+
+RECT ResultList::NameTextRect(int row) const {
+    HWND hdr = ListView_GetHeader(hwnd_);
+    RECT hr{}; GetWindowRect(hdr, &hr); MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&hr), 2);
+    RECT c{}; Header_GetItemRect(hdr, ColName, &c);
+    RECT ir{}; ListView_GetItemRect(hwnd_, row, &ir, LVIR_BOUNDS);
+    UINT dpi = DpiOf(hwnd_);
+    int isz = 16, isy = 16; if (g_sysImages) ImageList_GetIconSize(g_sysImages, &isz, &isy);
+    int pad = Scale(6, dpi);
+    return {c.left + hr.left + pad + isz + pad - Scale(3, dpi), ir.top, c.right + hr.left - pad, ir.bottom};
 }
 
 bool ResultList::WantsRealIcon(std::wstring_view ext) {
@@ -101,7 +154,32 @@ LRESULT CALLBACK ResultList::SubclassProc(HWND h, UINT m, WPARAM w, LPARAM l, UI
         return 0;
     }
     case WM_PRINTCLIENT: { RECT rc; GetClientRect(h, &rc); self->Paint(reinterpret_cast<HDC>(w), rc); return 0; }
+    // 滚动：ListView 内部用 ScrollWindowEx 搬移旧像素，只让露出的条带失效；我们自绘时旧像素与新顶行
+    // 可能错位（平滑滚动/部分行）造成重影。滚动后整块客户区重绘（双缓冲，单帧约 1 ms）。
+    case WM_VSCROLL: case WM_HSCROLL: case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL: case LVM_SCROLL: case LVM_ENSUREVISIBLE: {
+        int top = ListView_GetTopIndex(h); int hx = GetScrollPos(h, SB_HORZ);
+        LRESULT r = DefSubclassProc(h, m, w, l);
+        if (top != ListView_GetTopIndex(h) || hx != GetScrollPos(h, SB_HORZ)) { InvalidateRect(h, nullptr, FALSE); UpdateWindow(h); }
+        return r;
+    }
+    case WM_KEYDOWN: {
+        // 键盘导航：选择/焦点与滚动同时变化时 ListView 只失效部分行；整块重画（约 1.8 ms）
+        LRESULT r = DefSubclassProc(h, m, w, l);
+        InvalidateRect(h, nullptr, FALSE); UpdateWindow(h);
+        return r;
+    }
     case WM_SETFOCUS: case WM_KILLFOCUS: InvalidateRect(h, nullptr, FALSE); break;
+    case WM_NOTIFY: {   // 列头通知先到列表本身
+        auto* nm = reinterpret_cast<NMHDR*>(l);
+        if (nm->hwndFrom == ListView_GetHeader(h)) {
+            if (nm->code == NM_RCLICK) { POINT pt; GetCursorPos(&pt); self->ColumnMenu(pt); return TRUE; }
+            if (nm->code == HDN_BEGINTRACKW || nm->code == HDN_BEGINTRACKA || nm->code == HDN_DIVIDERDBLCLICKW || nm->code == HDN_DIVIDERDBLCLICKA) {
+                int c = reinterpret_cast<NMHEADERW*>(l)->iItem;
+                if (!self->ColumnVisible(c)) return TRUE;   // 隐藏列不可拖宽
+            }
+        }
+        break;
+    }
     case WM_NCDESTROY: RemoveWindowSubclass(h, SubclassProc, 1); break;
     }
     return DefSubclassProc(h, m, w, l);
@@ -110,7 +188,9 @@ LRESULT CALLBACK ResultList::SubclassProc(HWND h, UINT m, WPARAM w, LPARAM l, UI
 std::vector<int> ResultList::ColumnWidths() const {
     std::vector<int> w;
     UINT dpi = DpiOf(hwnd_);
-    for (int i = 0; i < ColCount; ++i) w.push_back(MulDiv(ListView_GetColumnWidth(hwnd_, i), 96, static_cast<int>(dpi)));
+    auto& s = GetSettings();
+    int saved[ColCount] = {s.colName, s.colPath, s.colSize, s.colDate};
+    for (int i = 0; i < ColCount; ++i) w.push_back(ColumnVisible(i) ? MulDiv(ListView_GetColumnWidth(hwnd_, i), 96, static_cast<int>(dpi)) : saved[i]);
     return w;
 }
 
@@ -297,9 +377,12 @@ void ResultList::Paint(HDC target, const RECT& clip) {
     RECT hr{}; GetWindowRect(hdr, &hr); MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&hr), 2);
     int top = hr.bottom;
     RECT cols[ColCount]{}; int right = cl.right;
+    // 水平偏移取滚动条位置（列头窗口的移动可能晚于本次绘制）
+    const int hx = -GetScrollPos(hwnd_, SB_HORZ);
+    hr.left = hx;
     for (int c = 0; c < ColCount; ++c) {
         RECT r{}; Header_GetItemRect(hdr, c, &r);
-        cols[c] = {r.left + hr.left, 0, r.right + hr.left, 0};
+        cols[c] = {r.left + hx, 0, r.right + hx, 0};
         right = std::max<int>(right, cols[c].right);
     }
     HGDIOBJ of = SelectObject(dc, font_);
@@ -311,13 +394,12 @@ void ResultList::Paint(HDC target, const RECT& clip) {
             int y = top + (row - first) * rowH_;
             if (y >= cl.bottom) break;
             RECT rr{hr.left, y, right, y + rowH_};
-            if (rr.bottom <= clip.top || rr.top >= clip.bottom) continue;
             DrawRow(dc, row, rr, cols, focused);
         }
     }
     SelectObject(dc, of);
-    BitBlt(target, clip.left, std::max<int>(clip.top, top), clip.right - clip.left,
-           clip.bottom - std::max<int>(clip.top, top), dc, clip.left, std::max<int>(clip.top, top), SRCCOPY);
+    (void)clip;   // 总是按当前顶行重画并输出整个列表区（不信任残留像素）
+    BitBlt(target, 0, top, cl.right, cl.bottom - top, dc, 0, top, SRCCOPY);
 }
 
 bool ResultList::OnNotify(NMHDR* nm, LRESULT* out) {
@@ -351,6 +433,7 @@ bool ResultList::OnNotify(NMHDR* nm, LRESULT* out) {
         *out = 0;
         return true;
     }
+    case LVN_ENDSCROLL: InvalidateRect(hwnd_, nullptr, FALSE); *out = 0; return true;
     case LVN_ODFINDITEMW: {   // 键入跳转：名称前缀（折叠比较）
         auto* fi = reinterpret_cast<NMLVFINDITEMW*>(nm);
         *out = -1;

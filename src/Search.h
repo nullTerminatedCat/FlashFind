@@ -16,7 +16,10 @@ void SortItems(const IndexData& d, std::vector<uint32_t>& items, SortSpec s, con
 
 // 完整搜索语法（| ! < > ext: size: dm: path: file: folder: 通配符）
 struct Query;
-std::shared_ptr<Query> CompileQuery(const std::wstring& text);
+// regexMode：整个 text 为一个 PCRE2 正则（match_regex=1）；extra：额外的语法表达式（过滤器），与之 AND
+std::shared_ptr<Query> CompileQuery(const std::wstring& text, bool regexMode = false, const std::wstring& extra = {});
+// 正则编译错误（空 = 无错误）
+const std::wstring& QueryError(const Query& q);
 const std::vector<std::wstring>& QueryHighlight(const Query& q);
 bool SearchQuery(const IndexData& d, const Query& q, std::vector<uint32_t>& out, const std::function<bool()>& cancelled);
 
@@ -27,6 +30,7 @@ struct SearchResult {
     SortSpec sort;
     std::vector<std::wstring> terms;  // 折叠后的搜索词（用于高亮）
     double elapsedMs = 0;
+    std::wstring error;               // 正则编译错误
 };
 
 std::vector<std::wstring> ParseTerms(const std::wstring& query);
@@ -41,7 +45,7 @@ public:
     explicit Searcher(HWND notify);
     ~Searcher();
     // data 为空（索引未就绪）时直接丢弃请求，绝不发布 0 结果
-    void Request(const std::wstring& query, std::shared_ptr<const IndexData> data, SortSpec sort = {});
+    void Request(const std::wstring& query, std::shared_ptr<const IndexData> data, SortSpec sort = {}, bool regex = false, std::wstring filter = {});
     std::shared_ptr<SearchResult> Latest();
 
 private:
@@ -51,7 +55,7 @@ private:
     std::mutex mu_;
     std::condition_variable cv_;
     bool quit_ = false, pending_ = false;
-    std::wstring query_;
+    std::wstring query_, filter_; bool regex_ = false;
     SortSpec sort_;
     // 只改排序时复用上次的匹配结果（仅搜索线程访问）
     std::wstring lastQ_; std::shared_ptr<const IndexData> lastD_; std::vector<uint32_t> lastItems_;

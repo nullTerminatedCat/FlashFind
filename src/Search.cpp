@@ -3,6 +3,8 @@
 #include "Fold.h"
 #include <algorithm>
 #include <chrono>
+#define PCRE2_CODE_UNIT_WIDTH 16
+#include <pcre2.h>
 
 namespace ff {
 
@@ -96,8 +98,14 @@ bool WildcardMatch(std::wstring_view s, const std::wstring& foldedTerm) { return
 // 函数：ext:a;b  size:[比较]N[kb|mb|gb] / A..B / empty tiny small medium large huge gigantic
 //       dm:today yesterday thisweek lastweek thismonth lastmonth thisyear lastyear / YYYY[-MM[-DD]] / 比较 / A..B
 //       path:词（匹配完整路径） file:[词] folder:[词]
+// PCRE2（UTF-16，JIT）：每次搜索编译一次，每个工作线程一个 match_data
+struct RegexProg {
+    pcre2_code_16* code = nullptr; bool jit = false;
+    ~RegexProg() { if (code) pcre2_code_free_16(code); }
+};
 struct QNode {
-    enum Kind : uint8_t { And, Or, Not, Pat, Ext, Size, Date, IsFile, IsDir } kind;
+    enum Kind : uint8_t { And, Or, Not, Pat, Ext, Size, Date, IsFile, IsDir, Regex } kind;
+    std::shared_ptr<RegexProg> re;
     std::vector<uint32_t> kids;
     Pattern pat;
     std::vector<std::wstring> exts;
@@ -109,6 +117,8 @@ struct Query {
     int root = -1;
     std::vector<std::wstring> highlight;
     bool everything = true;   // 空查询或全部为 *
+    bool hasRegex = false;
+    std::wstring error;
 };
 
 namespace {
@@ -121,6 +131,10 @@ std::vector<std::wstring> Tokenize(const std::wstring& q) {
     for (wchar_t c : q) {
         if (c == L'"') { quote = !quote; any = true; cur += L'\x01'; continue; }   // \x01 标记“出现过引号”，之后剔除
         if (!quote && (c == L' ' || c == L'\t')) { flush(); continue; }
+        if (!quote) {   // regex:参数里的 | < > 是正则语法，不是分组（含空格须加引号）
+            size_t s0 = cur.find_first_not_of(L'!');
+            if (s0 != std::wstring::npos && cur.size() >= s0 + 6 && _wcsnicmp(cur.c_str() + s0, L"regex:", 6) == 0) { cur += c; any = true; continue; }
+        }
         if (!quote && (c == L'|' || c == L'<' || c == L'>')) {
             // size:>10mb 之类：函数参数里的 < > 不是分组
             size_t colon = cur.find(L':');
@@ -287,9 +301,29 @@ private:
                 return Add(QNode::And, {static_cast<uint32_t>(f), static_cast<uint32_t>(pnode)});
             }
             if (fn == L"path") return PatLeaf(arg, true, neg);
+            if (fn == L"regex") return RegexLeaf(arg);
         }
         return PatLeaf(tok, false, neg);
     }
+public:
+    // 匹配名称；正则含 \\（转义的反斜杠）时匹配完整路径
+    int RegexLeaf(const std::wstring& pat) {
+        QNode nd{}; nd.kind = QNode::Regex; nd.re = std::make_shared<RegexProg>();
+        int ec = 0; PCRE2_SIZE eo = 0;
+        nd.re->code = pcre2_compile_16(reinterpret_cast<PCRE2_SPTR16>(pat.c_str()), pat.size(),
+                                       PCRE2_CASELESS | PCRE2_UTF | PCRE2_MATCH_INVALID_UTF, &ec, &eo, nullptr);
+        if (!nd.re->code) {
+            PCRE2_UCHAR16 msg[256] = {}; pcre2_get_error_message_16(ec, msg, 256);
+            wchar_t b[64]; swprintf_s(b, L"（位置 %zu）", static_cast<size_t>(eo));
+            if (q_.error.empty()) q_.error = L"正则错误：" + std::wstring(reinterpret_cast<const wchar_t*>(msg)) + b;
+        } else {
+            nd.re->jit = pcre2_jit_compile_16(nd.re->code, PCRE2_JIT_COMPLETE) == 0;
+        }
+        nd.needPath = pat.find(L"\\\\") != std::wstring::npos;
+        q_.hasRegex = true;
+        return AddNode(std::move(nd));
+    }
+private:
     int PatLeaf(const std::wstring& raw, bool forcePath, bool neg) {
         std::wstring t = FoldStr(raw);
         QNode nd{}; nd.kind = QNode::Pat; nd.pat = Compile(t);
@@ -316,7 +350,7 @@ bool Prepare(Query& q, uint32_t i) {
 }
 
 struct EvalCtx {
-    const IndexData& d; uint32_t i; std::wstring_view name; std::vector<wchar_t>& full; size_t flen = SIZE_MAX;
+    const IndexData& d; uint32_t i; std::wstring_view name; std::vector<wchar_t>& full; pcre2_match_data_16* md = nullptr; size_t flen = SIZE_MAX;
     std::wstring_view Full() { if (flen == SIZE_MAX) { if (full.empty()) full.resize(32768); flen = d.FullPathInto(i, full.data(), full.size()); } return {full.data(), flen}; }
 };
 
@@ -328,6 +362,14 @@ bool Eval(const Query& q, uint32_t ni, EvalCtx& c) {
     case QNode::Or: for (uint32_t k : n.kids) if (Eval(q, k, c)) return true; return false;
     case QNode::Not: return !Eval(q, n.kids[0], c);
     case QNode::Pat: return n.pat.path ? Match(c.Full(), n.pat) : Match(c.name, n.pat);
+    case QNode::Regex: {
+        if (!n.re->code || !c.md) return false;
+        std::wstring_view s = n.needPath ? c.Full() : c.name;
+        auto sp = reinterpret_cast<PCRE2_SPTR16>(s.data());
+        int rc = n.re->jit ? pcre2_jit_match_16(n.re->code, sp, s.size(), 0, 0, c.md, nullptr)
+                           : pcre2_match_16(n.re->code, sp, s.size(), 0, 0, c.md, nullptr);
+        return rc >= 0;
+    }
     case QNode::IsFile: return !e.IsDir();
     case QNode::IsDir: return e.IsDir();
     case QNode::Size: return !e.IsDir() && e.size >= n.lo && e.size <= n.hi;
@@ -348,21 +390,33 @@ bool Eval(const Query& q, uint32_t ni, EvalCtx& c) {
 }
 } // namespace
 
-std::shared_ptr<Query> CompileQuery(const std::wstring& text) {
+std::shared_ptr<Query> CompileQuery(const std::wstring& text, bool regexMode, const std::wstring& extra) {
     InitFold();
     auto q = std::make_shared<Query>();
-    Parser p(*q, Tokenize(text));
+    if (regexMode) {
+        std::vector<uint32_t> kids;
+        if (!text.empty()) { Parser rp(*q, {}); kids.push_back(static_cast<uint32_t>(rp.RegexLeaf(text))); q->everything = false; }
+        if (!extra.empty()) { Parser ep(*q, Tokenize(extra)); int r = ep.ParseAnd(); if (r >= 0) kids.push_back(static_cast<uint32_t>(r)); }
+        if (kids.size() == 1) q->root = static_cast<int>(kids[0]);
+        else if (kids.size() > 1) { QNode a{}; a.kind = QNode::And; a.kids = kids; q->nodes.push_back(std::move(a)); q->root = static_cast<int>(q->nodes.size() - 1); }
+        if (q->root >= 0) { q->everything = false; Prepare(*q, static_cast<uint32_t>(q->root)); } else q->everything = true;
+        return q;
+    }
+    Parser p(*q, Tokenize(extra.empty() ? text : (text.find_first_not_of(L" \t") == std::wstring::npos ? extra : L"<" + text + L"> " + extra)));
     q->root = p.ParseAnd();
+    if (q->hasRegex) q->everything = false;
     if (q->root >= 0) Prepare(*q, static_cast<uint32_t>(q->root));
     if (q->root < 0) q->everything = true;
     return q;
 }
 
 const std::vector<std::wstring>& QueryHighlight(const Query& q) { return q.highlight; }
+const std::wstring& QueryError(const Query& q) { return q.error; }
 
 bool SearchQuery(const IndexData& d, const Query& q, std::vector<uint32_t>& out, const std::function<bool()>& cancelled) {
     const auto& order = d.byName;
     out.clear();
+    if (!q.error.empty()) return true;   // 正则错误：无结果
     if (q.everything || q.root < 0) { out = order; return true; }
     const size_t n = order.size();
     unsigned nt = std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
@@ -374,10 +428,12 @@ bool SearchQuery(const IndexData& d, const Query& q, std::vector<uint32_t>& out,
         size_t b = n * t / nt, e = n * (t + 1) / nt;
         auto& o = parts[t];
         std::vector<wchar_t> full;
+        pcre2_match_data_16* md = q.hasRegex ? pcre2_match_data_create_16(1, nullptr) : nullptr;
+        struct MdFree { pcre2_match_data_16* m; ~MdFree() { if (m) pcre2_match_data_free_16(m); } } mdf{md};
         for (size_t k = b; k < e; ++k) {
             if ((k & 0x3FFF) == 0 && (stop || cancelled())) { stop = true; return; }
             uint32_t i = order[k];
-            EvalCtx c{d, i, d.Name(i), full};
+            EvalCtx c{d, i, d.Name(i), full, md};
             if (Eval(q, root, c)) o.push_back(i);
         }
     };
@@ -485,9 +541,9 @@ Searcher::~Searcher() {
     th_.join();
 }
 
-void Searcher::Request(const std::wstring& query, std::shared_ptr<const IndexData> data, SortSpec sort) {
+void Searcher::Request(const std::wstring& query, std::shared_ptr<const IndexData> data, SortSpec sort, bool regex, std::wstring filter) {
     if (!data) return;
-    { std::lock_guard lk(mu_); query_ = query; data_ = std::move(data); sort_ = sort; pending_ = true; ++gen_; }
+    { std::lock_guard lk(mu_); query_ = query; filter_ = std::move(filter); regex_ = regex; data_ = std::move(data); sort_ = sort; pending_ = true; ++gen_; }
     cv_.notify_all();
 }
 
@@ -495,18 +551,19 @@ std::shared_ptr<SearchResult> Searcher::Latest() { std::lock_guard lk(mu_); retu
 
 void Searcher::Loop() {
     for (;;) {
-        std::wstring q; std::shared_ptr<const IndexData> d; uint64_t g; SortSpec so;
+        std::wstring q, flt; bool rx; std::shared_ptr<const IndexData> d; uint64_t g; SortSpec so;
         {
             std::unique_lock lk(mu_);
             cv_.wait(lk, [&] { return quit_ || pending_; });
             if (quit_) return;
-            pending_ = false; q = query_; d = data_; g = gen_; so = sort_;
+            pending_ = false; q = query_; flt = filter_; rx = regex_; d = data_; g = gen_; so = sort_;
         }
         if (!d) continue;
         auto t0 = std::chrono::steady_clock::now();
         auto res = std::make_shared<SearchResult>();
-        auto cq = CompileQuery(q);
-        res->generation = g; res->data = d; res->terms = cq->highlight; res->sort = so;
+        auto cq = CompileQuery(q, rx, flt);
+        res->generation = g; res->data = d; res->terms = cq->highlight; res->sort = so; res->error = cq->error;
+        q = (rx ? L"\x02" : L"\x03") + flt + L"\x04" + q;   // 复用判断的键
         if (d == lastD_ && q == lastQ_) res->items = lastItems_;   // 只改了排序
         else {
             if (!SearchQuery(*d, *cq, res->items, [&] { return gen_ != g; })) continue;

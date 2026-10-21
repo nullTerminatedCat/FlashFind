@@ -2,8 +2,13 @@
 #include "MainWindow.h"
 #include "Settings.h"
 #include "Theme.h"
+#include "ResultList.h"
 #include <commctrl.h>
 #include <objbase.h>
+#include <ole2.h>
+#include <csignal>
+#include <exception>
+#include <cstdio>
 #include <shellapi.h>
 #include <psapi.h>
 #include <algorithm>
@@ -620,6 +625,125 @@ static int SyntaxTest(std::wstring dbPath) {
     return fails ? 1 : 0;
 }
 
+// -regextest [db]：PCRE2 正则（单元 + 大索引耗时）
+static int RegexTest(std::wstring dbPath) {
+    std::wstring out; wchar_t buf[1024]; int fails = 0;
+    VolumeData v; v.info.root = L"T:"; v.info.ntfs = true;
+    v.Add(L"T:", 2, kNoParent, kFlagDir, 0, 0);
+    auto add = [&](const wchar_t* nm, uint32_t parent, bool dir) { return v.Add(nm, static_cast<uint32_t>(wcslen(nm)), parent, dir ? kFlagDir : 0, 1, 0); };
+    uint32_t docs = add(L"Docs", 0, true), win = add(L"Windows", 0, true);
+    add(L"report2024.docx", docs, false); add(L"Report_v2.pdf", docs, false); add(L"notes.txt", docs, false);
+    add(L"中文报告.TXT", docs, false); add(L"notepad.exe", win, false); add(L"a|b.txt", win, false);
+    std::vector<VolumeData> vols; vols.push_back(std::move(v));
+    auto d = Merge(vols, 0);
+    auto names = [&](const wchar_t* q, bool rx, const wchar_t* extra, std::wstring* err) {
+        auto cq = CompileQuery(q, rx, extra); std::vector<uint32_t> r; SearchQuery(*d, *cq, r, [] { return false; });
+        if (err) *err = QueryError(*cq);
+        std::vector<std::wstring> n; for (uint32_t i : r) n.emplace_back(d->Name(i)); std::sort(n.begin(), n.end());
+        std::wstring s; for (auto& x : n) { if (!s.empty()) s += L","; s += x; } return s;
+    };
+    auto T = [&](const wchar_t* q, bool rx, const wchar_t* extra, const wchar_t* want) {
+        std::wstring got = names(q, rx, extra, nullptr); bool ok = got == want;
+        swprintf_s(buf, L"  %s %s%-28s %-10s => %s%s%s\r\n", ok ? L"[OK]  " : L"[FAIL]", rx ? L"(模式)" : L"", q, extra, got.c_str(), ok ? L"" : L"  期望 ", ok ? L"" : want); out += buf;
+        if (!ok) ++fails;
+    };
+    out += L"[unit]\r\n";
+    T(L"regex:^report\\d+", false, L"", L"report2024.docx");
+    T(L"regex:^rep", false, L"", L"Report_v2.pdf,report2024.docx");
+    T(L"regex:\\.(exe|pdf)$", false, L"", L"Report_v2.pdf,notepad.exe");
+    T(L"regex:\"^not.*(txt|exe)$\"", false, L"", L"notepad.exe,notes.txt");
+    T(L"!regex:\\.txt$ file:", false, L"", L"Report_v2.pdf,notepad.exe,report2024.docx");
+    T(L"regex:^中文", false, L"", L"中文报告.TXT");
+    T(L"regex:docs\\\\", false, L"", L"Report_v2.pdf,notes.txt,report2024.docx,中文报告.TXT");
+    T(L"^(notes|notepad)\\.", true, L"", L"notepad.exe,notes.txt");
+    T(L"a\\|b", true, L"", L"a|b.txt");
+    T(L"^n", true, L"ext:exe", L"notepad.exe");
+    T(L"", true, L"ext:pdf", L"Report_v2.pdf");
+    {
+        std::wstring err; std::wstring got = names(L"regex:(abc", false, L"", &err);
+        bool ok = !err.empty() && got.empty();
+        swprintf_s(buf, L"  %s 编译错误报告：%s\r\n", ok ? L"[OK]  " : L"[FAIL]", err.c_str()); out += buf; if (!ok) ++fails;
+    }
+    InitFold(); g_fastAscii = true;
+    std::wstring err; if (dbPath.empty()) dbPath = Indexer::DefaultDbPath();
+    auto big = LoadDbCopy(dbPath, err);
+    if (!big) { out += L"[db] 无数据库，改用合成索引\r\n"; big = Synthesize(2260000); }
+    swprintf_s(buf, L"[db] %zu 个对象\r\n", big->entries.size()); out += buf;
+    struct { const wchar_t* q; bool rx; } qs[] = {
+        {L"\\.exe$", true}, {L"^report", true}, {L"^[a-z]+\\d{3,}\\.(jpg|png)$", true}, {L"(?i)setup.*\\.msi$", true}, {L"^.*$", true},
+        {L"\\d{4}-\\d{2}-\\d{2}", true}, {L"windows\\\\system32\\\\.*\\.dll$", true}, {L"ext:exe", false}, {L"*.exe", false}};
+    for (auto& x : qs) {
+        double c0 = NowMs(); auto cq = CompileQuery(x.q, x.rx); double cms = NowMs() - c0;
+        std::vector<uint32_t> res; double best = 1e9;
+        for (int k = 0; k < 5; ++k) { double a = NowMs(); SearchQuery(*big, *cq, res, [] { return false; }); best = std::min(best, NowMs() - a); }
+        swprintf_s(buf, L"[search] %s%-36s results=%-8zu compile=%5.2f ms best=%7.2f ms\r\n", x.rx ? L"regex " : L"      ", x.q, res.size(), cms, best); out += buf;
+    }
+    {   // 交叉验证：file: regex:\.exe$ 与 ext:exe 结果数一致
+        std::vector<uint32_t> a, b;
+        SearchQuery(*big, *CompileQuery(L"file: regex:\\.exe$"), a, [] { return false; });
+        SearchQuery(*big, *CompileQuery(L"ext:exe"), b, [] { return false; });
+        bool ok = a == b; swprintf_s(buf, L"  %s file: regex:\\.exe$ (%zu) == ext:exe (%zu)\r\n", ok ? L"[OK]  " : L"[FAIL]", a.size(), b.size()); out += buf; if (!ok) ++fails;
+    }
+    swprintf_s(buf, L"[result] %s (%d failed)\r\n", fails ? L"FAIL" : L"PASS", fails); out += buf;
+    WriteOut(L"ff_regextest.txt", out);
+    return fails ? 1 : 0;
+}
+
+// -scrolltest：滚动重影自检。真实窗口上滚动（行/页/滚轮/水平），抓取屏幕像素，与强制整窗重画后的像素逐点比较
+static int ScrollTest() {
+    std::wstring out; wchar_t buf[512]; int fails = 0;
+    OleInitialize(nullptr);
+    INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_LISTVIEW_CLASSES}; InitCommonControlsEx(&icc);
+    GetTheme().Resolve(ThemeMode::Light);
+    WNDCLASSW wc{}; wc.lpfnWndProc = DefWindowProcW; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"FFScrollTest"; RegisterClassW(&wc);
+    HWND top = CreateWindowExW(WS_EX_TOPMOST, L"FFScrollTest", L"scrolltest", WS_POPUP | WS_VISIBLE, 40, 40, 700, 500, nullptr, nullptr, wc.hInstance, nullptr);
+    ResultList list; HWND lv = list.Create(top, 1);
+    MoveWindow(lv, 0, 0, 700, 500, TRUE);
+    NONCLIENTMETRICSW ncm{sizeof(ncm)}; SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+    HFONT f = CreateFontIndirectW(&ncm.lfMessageFont); list.SetFont(f, f, 26);
+    ListView_SetColumnWidth(lv, 0, 400); ListView_SetColumnWidth(lv, 1, 600);   // 产生水平滚动条
+    auto d = Synthesize(20000);
+    auto r = std::make_shared<SearchResult>(); r->data = d; r->items = d->byName; r->items.resize(5000);
+    list.SetResultsForTest(r);
+    SetForegroundWindow(top); SetFocus(lv);
+    auto pump = [] { MSG m; for (int k = 0; k < 50; ++k) { while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); } Sleep(2); } };
+    auto grab = [&](std::vector<uint32_t>& px) {
+        RECT rc; GetClientRect(lv, &rc); HDC sdc = GetDC(nullptr); POINT o{0, 0}; ClientToScreen(lv, &o);
+        HDC mdc = CreateCompatibleDC(sdc); BITMAPINFO bi{}; bi.bmiHeader = {sizeof(BITMAPINFOHEADER), rc.right, -rc.bottom, 1, 32, BI_RGB};
+        void* bits = nullptr; HBITMAP bm = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0); HGDIOBJ ob = SelectObject(mdc, bm);
+        BitBlt(mdc, 0, 0, rc.right, rc.bottom, sdc, o.x, o.y, SRCCOPY);
+        px.assign(static_cast<uint32_t*>(bits), static_cast<uint32_t*>(bits) + rc.right * rc.bottom);
+        SelectObject(mdc, ob); DeleteObject(bm); DeleteDC(mdc); ReleaseDC(nullptr, sdc);
+    };
+    pump();
+    struct Step { const wchar_t* name; UINT m; WPARAM w; } steps[] = {
+        {L"行下 x3", WM_VSCROLL, SB_LINEDOWN}, {L"页下", WM_VSCROLL, SB_PAGEDOWN}, {L"滚轮下", WM_MOUSEWHEEL, MAKEWPARAM(0, static_cast<WORD>(-WHEEL_DELTA))},
+        {L"滚轮上", WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA)}, {L"行上", WM_VSCROLL, SB_LINEUP}, {L"水平右", WM_HSCROLL, SB_PAGERIGHT}, {L"水平左", WM_HSCROLL, SB_LINELEFT},
+        {L"键 PageDown", WM_KEYDOWN, VK_NEXT}, {L"键 Down x3", WM_KEYDOWN, VK_DOWN}};
+    for (auto& st : steps) {
+        RECT c; GetClientRect(lv, &c); POINT mid{c.right / 2, c.bottom / 2}; ClientToScreen(lv, &mid);
+        int reps = wcsstr(st.name, L"x3") ? 3 : 1;
+        for (int k = 0; k < reps; ++k) SendMessageW(lv, st.m, st.w, st.m == WM_MOUSEWHEEL ? MAKELPARAM(mid.x, mid.y) : 0);
+        pump(); pump(); pump(); pump(); pump(); pump(); pump(); pump(); pump(); pump();   // 选择变化有主题淡入动画：等它结束
+        std::vector<uint32_t> a, b; grab(a);
+        RedrawWindow(lv, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN); pump(); grab(b);
+        RECT hr{}; GetWindowRect(ListView_GetHeader(lv), &hr); RECT cr; GetClientRect(lv, &cr);
+        size_t from = static_cast<size_t>(hr.bottom - hr.top) * cr.right;   // 只比较列表行区域（列头有悬停动画）
+        size_t diff = 0; for (size_t k = from; k < a.size() && k < b.size(); ++k) if (a[k] != b[k]) ++diff;
+        bool ok = diff == 0 && !a.empty();
+        swprintf_s(buf, L"  %s %-12s 顶行=%d 焦点行=%d 差异像素=%zu\r\n", ok ? L"[OK]  " : L"[FAIL]", st.name, ListView_GetTopIndex(lv), ListView_GetNextItem(lv, -1, LVNI_FOCUSED), diff); out += buf;
+        if (!ok) ++fails;
+    }
+    {   // 整窗重画耗时
+        double best = 1e9; for (int k = 0; k < 20; ++k) { double t0 = NowMs(); RedrawWindow(lv, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW); best = std::min(best, NowMs() - t0); }
+        swprintf_s(buf, L"[paint] 整个列表重画 %.2f ms\r\n", best); out += buf;
+    }
+    DestroyWindow(top); DeleteObject(f);
+    swprintf_s(buf, L"[result] %s (%d failed)\r\n", fails ? L"FAIL" : L"PASS", fails); out += buf;
+    WriteOut(L"ff_scrolltest.txt", out);
+    return fails ? 1 : 0;
+}
+
 // -icontest [db]：真实图标（SHGetFileInfo 读文件）与按扩展名图标的耗时对比
 static int IconTest(std::wstring dbPath) {
     std::wstring out; wchar_t buf[512];
@@ -736,6 +860,32 @@ static int SvcConsole() {
     return r;
 }
 
+// 测试模式的崩溃诊断：未捕获异常 / abort / CRT 无效参数（都会表现为 0xc0000409）时打印原因与调用栈（模块偏移）
+static void DumpStack(const char* why) {
+    void* fr[48]; USHORT n = CaptureStackBackTrace(1, 48, fr, nullptr);
+    HMODULE self = GetModuleHandleW(nullptr);
+    fprintf(stderr, "[crash] %s\n", why);
+    for (USHORT i = 0; i < n; ++i) {
+        HMODULE m = nullptr; GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(fr[i]), &m);
+        fprintf(stderr, "  #%02u %s+0x%llx\n", i, m == self ? "FlashFind" : "other", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(fr[i]) - reinterpret_cast<uintptr_t>(m)));
+    }
+    fflush(stderr);
+}
+static void InstallCrashDiag() {
+    std::set_terminate([] {
+        const char* w = "terminate";
+        try { if (auto e = std::current_exception()) std::rethrow_exception(e); } catch (const std::exception& e) { DumpStack(e.what()); TerminateProcess(GetCurrentProcess(), 3); } catch (...) {}
+        DumpStack(w); TerminateProcess(GetCurrentProcess(), 3);
+    });
+    signal(SIGABRT, [](int) { DumpStack("abort"); TerminateProcess(GetCurrentProcess(), 3); });
+    _set_invalid_parameter_handler([](const wchar_t*, const wchar_t*, const wchar_t*, unsigned, uintptr_t) { DumpStack("CRT invalid parameter"); TerminateProcess(GetCurrentProcess(), 4); });
+    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
+        char b[64]; sprintf_s(b, "SEH 0x%08lx", ep->ExceptionRecord->ExceptionCode); DumpStack(b);
+        HMODULE m = nullptr; GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(ep->ExceptionRecord->ExceptionAddress), &m);
+        fprintf(stderr, "  at +0x%llx\n", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress) - reinterpret_cast<uintptr_t>(m))); fflush(stderr);
+        return EXCEPTION_EXECUTE_HANDLER; });
+}
+
 int App::Run(HINSTANCE inst, int show) {
     g_inst = inst;
     {
@@ -743,11 +893,14 @@ int App::Run(HINSTANCE inst, int show) {
         std::wstring mode = argc >= 2 ? argv[1] : L"", arg = argc >= 3 ? argv[2] : L"";
         LocalFree(argv);
         if (wcsstr(GetCommandLineW(), L"-debug-log")) g_debugLog = true;
+        if (mode.size() > 5 && mode.compare(mode.size() - 4, 4, L"test") == 0) InstallCrashDiag();
         if (mode == L"-svc") return ServiceMain();
         if (mode == L"-svc-console") return SvcConsole();
         if (mode == L"-install-service") return InstallService();
         if (mode == L"-uninstall-service") return UninstallService();
         if (mode == L"-icontest") { InitFold(); return IconTest(arg); }
+        if (mode == L"-scrolltest") { InitFold(); return ScrollTest(); }
+        if (mode == L"-regextest") { InitFold(); g_fastAscii = true; return RegexTest(arg); }
         if (mode == L"-syntaxtest") { InitFold(); g_fastAscii = true; return SyntaxTest(arg); }
         if (mode == L"-sorttest") { InitFold(); g_fastAscii = true; return SortTest(arg); }
         if (mode == L"-wildtest") { InitFold(); g_fastAscii = true; return WildTest(arg); }
@@ -771,7 +924,7 @@ int App::Run(HINSTANCE inst, int show) {
         return 0;
     }
 
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    OleInitialize(nullptr);   // STA + OLE 拖放（拖出到资源管理器）
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
 
@@ -790,7 +943,7 @@ int App::Run(HINSTANCE inst, int show) {
         DispatchMessageW(&msg);
     }
     GetSettings().Save();
-    CoUninitialize();
+    OleUninitialize();
     if (mutex) CloseHandle(mutex);
     return static_cast<int>(msg.wParam);
 }

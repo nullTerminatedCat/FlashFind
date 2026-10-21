@@ -105,7 +105,13 @@ void Settings::LoadFrom(const std::wstring& ini, bool detect) {
     colPath = ReadInt(ini, L"columns", L"path", colPath);
     colSize = ReadInt(ini, L"columns", L"size", colSize);
     colDate = ReadInt(ini, L"columns", L"date_modified", colDate);
+    colVisible[1] = ReadInt(ini, L"columns", L"path_visible", 1) != 0;
+    colVisible[2] = ReadInt(ini, L"columns", L"size_visible", 1) != 0;
+    colVisible[3] = ReadInt(ini, L"columns", L"date_modified_visible", 1) != 0;
+    allowRename = ReadInt(ini, L"general", L"allow_rename", 1) != 0;
+    singleParentContextMenu = ReadInt(ini, L"general", L"single_parent_context_menu", 1) != 0;
     filter = ReadInt(ini, L"search", L"filter", 0);
+    matchRegex = ReadInt(ini, L"search", L"match_regex", 0) != 0;
     sortCol = std::clamp(ReadInt(ini, L"columns", L"sort", 0), 0, 3);
     sortDesc = ReadInt(ini, L"columns", L"sort_ascending", 1) == 0;
     escHides = ReadInt(ini, L"behavior", L"esc_hides_window", 1) != 0;
@@ -154,7 +160,12 @@ void Settings::SaveTo(const std::wstring& ini) const {
     WriteInt(ini, L"window", L"maximized", maximized);
     WriteInt(ini, L"columns", L"name", colName); WriteInt(ini, L"columns", L"path", colPath);
     WriteInt(ini, L"columns", L"size", colSize); WriteInt(ini, L"columns", L"date_modified", colDate);
+    WriteInt(ini, L"columns", L"path_visible", colVisible[1]); WriteInt(ini, L"columns", L"size_visible", colVisible[2]);
+    WriteInt(ini, L"columns", L"date_modified_visible", colVisible[3]);
+    WriteInt(ini, L"general", L"allow_rename", allowRename);
+    WriteInt(ini, L"general", L"single_parent_context_menu", singleParentContextMenu);
     WriteInt(ini, L"search", L"filter", filter);
+    WriteInt(ini, L"search", L"match_regex", matchRegex);
     WriteInt(ini, L"columns", L"sort", sortCol); WriteInt(ini, L"columns", L"sort_ascending", !sortDesc);
     WriteInt(ini, L"behavior", L"esc_hides_window", escHides);
     WriteInt(ini, L"behavior", L"close_to_tray", closeToTray);

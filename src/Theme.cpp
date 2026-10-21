@@ -51,7 +51,23 @@ void Theme::Resolve(ThemeMode mode) {
     surface_ = CreateSolidBrush(p_.surface);
 }
 
+// 弹出菜单深色：uxtheme 未公开序号 135 SetPreferredAppMode（1.903+）、136 FlushMenuThemes
+static void SetMenuDark(bool dark) {
+    static HMODULE ux = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!ux) return;
+    using SetMode = int(WINAPI*)(int);
+    using Flush = void(WINAPI*)();
+    static auto set = reinterpret_cast<SetMode>(GetProcAddress(ux, MAKEINTRESOURCEA(135)));
+    static auto flush = reinterpret_cast<Flush>(GetProcAddress(ux, MAKEINTRESOURCEA(136)));
+    static int last = -1;
+    int mode = dark ? 2 : 3;   // ForceDark / ForceLight
+    if (!set || last == mode) return;
+    set(mode); last = mode;
+    if (flush) flush();
+}
+
 void Theme::ApplyToWindow(HWND hwnd) const {
+    SetMenuDark(dark_);
     BOOL d = dark_;
     DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &d, sizeof(d));
     if (IsWin11()) {

@@ -24,7 +24,7 @@ $stage = Join-Path $out ("staging-" + [Guid]::NewGuid().ToString('N'))
 $payload = Join-Path $stage $name
 New-Item -ItemType Directory -Force $payload | Out-Null
 Copy-Item $exe $payload
-Copy-Item LICENSE, README.md $payload
+Copy-Item LICENSE, README.md, THIRD_PARTY_NOTICES.md $payload
 $rev = (git rev-parse HEAD).Trim()
 "Version: $version`r`nArchitecture: $arch`r`nSource revision: $rev" | Set-Content (Join-Path $payload 'BUILD.txt') -Encoding UTF8
 

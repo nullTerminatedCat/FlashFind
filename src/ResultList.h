@@ -28,7 +28,12 @@ public:
     int SelectedCount() const;
     std::vector<uint32_t> Selection() const;
     int FocusedIndex() const;
-    std::vector<int> ColumnWidths() const;
+    std::vector<int> ColumnWidths() const;   // 逻辑像素；隐藏列返回记住的宽度
+    bool ColumnVisible(int c) const { return c == ColName || GetSettingsVisible(c); }
+    void SetColumnVisible(int c, bool v);
+    void ColumnMenu(POINT screenPt);         // 列头右键：显示/隐藏列
+    RECT NameTextRect(int row) const;
+    void SetResultsForTest(std::shared_ptr<SearchResult> r) { SetResults(std::move(r)); }        // 名称文字区域（列表客户区坐标；就地重命名编辑框）
     ~ResultList();
 
 private:
@@ -39,6 +44,8 @@ private:
     int IconFor(uint32_t i);
     void IconWorker();
     static bool WantsRealIcon(std::wstring_view ext);
+    static bool GetSettingsVisible(int c);
+    void UpdateHiddenColumns();
 
     HWND hwnd_ = nullptr;
     SortSpec sort_;

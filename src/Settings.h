@@ -13,6 +13,11 @@ struct Settings {
     bool maximized = false;
     int colName = 260, colPath = 380, colSize = 90, colDate = 140;
     int sortCol = 0; bool sortDesc = false;
+    bool colVisible[4] = {true, true, true, true};   // [columns] path_visible / size_visible / date_modified_visible（名称列总是显示）
+    // 行为：文件操作
+    bool allowRename = true;                 // [general] allow_rename：F2 重命名
+    bool singleParentContextMenu = true;     // [general] single_parent_context_menu：选择在同一文件夹时使用系统右键菜单
+    bool matchRegex = false;   // [search] match_regex
     int filter = 0;   // [search] filter：过滤器序号   // [columns] sort / sort_ascending
     // 行为
     bool escHides = true;

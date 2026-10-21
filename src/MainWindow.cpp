@@ -2,7 +2,7 @@
 #include "MainWindow.h"
 #include "NtfsSource.h"
 #include "Options.h"
-#include "Fold.h"
+#include "FileOps.h"
 #include <shellapi.h>
 #include <algorithm>
 #include "Dpi.h"
@@ -26,6 +26,8 @@ enum : int {
     IDM_UNINSTALL_SVC,
     IDC_SVC_BTN,
     IDM_OPTIONS,
+    IDM_REGEX,
+    IDM_RENAME, IDM_RENAME_COMMIT, IDM_DELETE, IDM_DELETE_PERM, IDM_COL_PATH, IDM_COL_SIZE, IDM_COL_DATE,
 };
 
 // 过滤器（与 Everything 默认过滤器相同的扩展名表）
@@ -40,13 +42,6 @@ static const FilterDef kFilters[] = {
     {L"图片", L"ext:ani;bmp;gif;heic;ico;jpe;jpeg;jpg;pcx;png;psd;svg;tga;tif;tiff;webp;wmf"},
     {L"视频", L"ext:3g2;3gp;3gp2;3gpp;amr;amv;asf;avi;bdmv;bik;d2v;divx;drc;dsa;dsm;dss;dsv;evo;f4v;flc;fli;flic;flv;hdmov;ifo;ivf;m1v;m2p;m2t;m2ts;m2v;m4b;m4p;m4v;mkv;mp2v;mp4;mp4v;mpe;mpeg;mpg;mpls;mpv2;mpv4;mov;mts;ogm;ogv;pss;pva;qt;ram;ratdvd;rm;rmm;rmvb;roq;rpm;smil;smk;swf;tp;tpr;ts;vob;vp6;webm;wm;wmp;wmv"},
 };
-
-static std::wstring ApplyFilter(const std::wstring& q, int filter) {
-    if (filter <= 0 || filter >= static_cast<int>(std::size(kFilters))) return q;
-    std::wstring f = kFilters[filter].expr;
-    bool blank = q.find_first_not_of(L" \t") == std::wstring::npos;
-    return blank ? f : L"<" + q + L"> " + f;
-}
 
 bool MainWindow::Create(int show) {
     HINSTANCE inst = App::Instance();
@@ -178,7 +173,14 @@ void MainWindow::BuildMenu() {
     AppendMenuW(theme, MF_STRING, IDM_THEME_SYSTEM, L"跟随系统");
     AppendMenuW(theme, MF_STRING, IDM_THEME_LIGHT, L"浅色");
     AppendMenuW(theme, MF_STRING, IDM_THEME_DARK, L"深色");
+    HMENU cols = CreatePopupMenu();
+    AppendMenuW(cols, MF_STRING, IDM_COL_PATH, L"路径(&P)");
+    AppendMenuW(cols, MF_STRING, IDM_COL_SIZE, L"大小(&S)");
+    AppendMenuW(cols, MF_STRING, IDM_COL_DATE, L"修改时间(&M)");
+    AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(cols), L"列(&C)");
     AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(theme), L"主题(&T)");
+    HMENU search = CreatePopupMenu();
+    AppendMenuW(search, MF_STRING, IDM_REGEX, L"启用正则表达式(&R)\tCtrl+R");
     HMENU tools = CreatePopupMenu();
     AppendMenuW(tools, MF_STRING, IDM_DOUBLE_CTRL, L"双击 Ctrl 显示/隐藏");
     AppendMenuW(tools, MF_STRING, IDM_OPTIONS, L"选项(&O)…\tCtrl+P");
@@ -195,6 +197,7 @@ void MainWindow::BuildMenu() {
     AppendMenuW(help, MF_STRING, IDM_ABOUT, L"关于闪寻(&A)…");
     AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"文件(&F)");
     AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"视图(&V)");
+    AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(search), L"搜索(&S)");
     AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(tools), L"工具(&T)");
     AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(help), L"帮助(&H)");
     SetMenu(hwnd_, bar);
@@ -225,7 +228,11 @@ void MainWindow::ApplyTheme() {
     HMENU bar = GetMenu(hwnd_);
     int sel = IDM_THEME_SYSTEM + static_cast<int>(GetSettings().theme);
     CheckMenuRadioItem(bar, IDM_THEME_SYSTEM, IDM_THEME_DARK, sel, MF_BYCOMMAND);
+    for (int c = 1; c < ColCount; ++c) CheckMenuItem(bar, IDM_COL_PATH + c - 1, MF_BYCOMMAND | (list_.ColumnVisible(c) ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_REGEX, MF_BYCOMMAND | (GetSettings().matchRegex ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(bar, IDM_DOUBLE_CTRL, MF_BYCOMMAND | (GetSettings().doubleCtrl ? MF_CHECKED : MF_UNCHECKED));
+    DrawMenuBar(hwnd_);
+    SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);   // 重画非客户区（菜单栏下方的线）
     InvalidateRect(hwnd_, nullptr, TRUE);
     InvalidateRect(edit_, nullptr, TRUE);
 }
@@ -341,7 +348,9 @@ void MainWindow::RunSearch() {
     int len = GetWindowTextLengthW(edit_);
     std::wstring q(static_cast<size_t>(len), L'\0');
     if (len) GetWindowTextW(edit_, q.data(), len + 1);
-    searcher_->Request(ApplyFilter(q, filter_ ? static_cast<int>(SendMessageW(filter_, CB_GETCURSEL, 0, 0)) : 0), std::move(snap), list_.Sort());
+    int f = filter_ ? static_cast<int>(SendMessageW(filter_, CB_GETCURSEL, 0, 0)) : 0;
+    std::wstring fx = f > 0 && f < static_cast<int>(std::size(kFilters)) ? kFilters[f].expr : L"";
+    searcher_->Request(q, std::move(snap), list_.Sort(), GetSettings().matchRegex, fx);
 }
 
 void MainWindow::UpdateTitle() {
@@ -365,6 +374,8 @@ void MainWindow::UpdateStatus() {
         }
         wchar_t ms[48]; swprintf_s(ms, L"  ·  %.0f ms", lastSearchMs_);
         s += ms;
+        if (GetSettings().matchRegex) s += L"  ·  正则";
+        if (!r->error.empty()) s = L"⚠ " + r->error;
     }
     std::wstring phase;
     switch (indexer_.Phase()) {
@@ -493,7 +504,7 @@ void MainWindow::ContextMenu(POINT pt) {
     auto sel = list_.Selection();
     const auto* res = list_.Results();
     IContextMenu* cm = nullptr;
-    if (res && res->data && sel.size() <= 4096) {
+    if (res && res->data && sel.size() <= 4096 && GetSettings().singleParentContextMenu) {
         const auto& d = *res->data;
         uint32_t parent = d.entries[sel[0]].parent;
         bool same = std::all_of(sel.begin(), sel.end(), [&](uint32_t i) { return d.entries[i].parent == parent; });
@@ -522,6 +533,8 @@ void MainWindow::ContextMenu(POINT pt) {
     AppendMenuW(m, MF_STRING, IDM_OPEN_PATH, L"打开路径(&P)\tCtrl+Enter");
     AppendMenuW(m, MF_STRING, IDM_COPY_PATH, L"复制完整路径(&C)\tCtrl+Shift+C");
     AppendMenuW(m, MF_STRING, IDM_COPY_NAME, L"复制名称(&N)");
+    if (GetSettings().allowRename) AppendMenuW(m, MF_STRING, IDM_RENAME, sel.size() > 1 ? L"重命名多个(&M)…\tF2" : L"重命名(&M)\tF2");
+    if (!cm) AppendMenuW(m, MF_STRING, IDM_DELETE, L"删除(&D)\tDel");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     if (cm) {
         UINT flags = CMF_NORMAL | ((GetKeyState(VK_SHIFT) < 0) ? CMF_EXTENDEDVERBS : 0);
@@ -537,8 +550,9 @@ void MainWindow::ContextMenu(POINT pt) {
     if (cm2_) { cm2_->Release(); cm2_ = nullptr; }
     if (cmd >= kFirst && cmd <= kLast && cm) {
         char verb[64] = {};
-        bool skip = SUCCEEDED(cm->GetCommandString(cmd - kFirst, GCS_VERBA, nullptr, verb, sizeof(verb))) && _stricmp(verb, "rename") == 0;   // 无就地编辑：忽略“重命名”
-        if (!skip) {
+        bool ren = SUCCEEDED(cm->GetCommandString(cmd - kFirst, GCS_VERBA, nullptr, verb, sizeof(verb))) && _stricmp(verb, "rename") == 0;
+        if (ren) PostMessageW(hwnd_, WM_COMMAND, IDM_RENAME, 0);   // 系统“重命名”改用我们的就地编辑
+        else {
             CMINVOKECOMMANDINFOEX ci{sizeof(ci)};
             ci.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE | (GetKeyState(VK_CONTROL) < 0 ? CMIC_MASK_CONTROL_DOWN : 0) | (GetKeyState(VK_SHIFT) < 0 ? CMIC_MASK_SHIFT_DOWN : 0);
             ci.hwnd = hwnd_;
@@ -582,9 +596,166 @@ void MainWindow::SavePlacement() {
     s.colName = w[0]; s.colPath = w[1]; s.colSize = w[2]; s.colDate = w[3];
 }
 
+// ---------- 文件操作 ----------
+std::vector<std::wstring> MainWindow::SelectedPaths() const {
+    std::vector<std::wstring> v;
+    auto r = list_.Results();
+    if (!r || !r->data) return v;
+    for (auto i : list_.Selection()) v.push_back(r->data->FullPath(i));
+    return v;
+}
+
+void MainWindow::Rename() {
+    if (!GetSettings().allowRename || renameEdit_) return;
+    auto r = list_.Results();
+    if (!r || !r->data) return;
+    auto sel = list_.Selection();
+    if (sel.empty()) return;
+    if (sel.size() == 1) { BeginInlineRename(); return; }
+    std::vector<std::wstring> paths, names;
+    for (auto i : sel) { paths.push_back(r->data->FullPath(i)); names.emplace_back(r->data->Name(i)); }
+    std::vector<std::wstring> newNames = names;
+    if (!ShowRenameDialog(hwnd_, paths, newNames)) return;
+    std::vector<RenameReq> reqs;
+    for (size_t k = 0; k < paths.size(); ++k) if (newNames[k] != names[k]) reqs.push_back({paths[k], newNames[k]});
+    if (reqs.empty()) return;
+    std::wstring err;
+    size_t n = RenameItems(hwnd_, reqs, err);
+    if (!err.empty() && err != L"操作被取消") MessageBoxW(hwnd_, (L"部分项目未能重命名：\n" + err).c_str(), kAppName, MB_ICONWARNING);
+    (void)n;
+}
+
+void MainWindow::BeginInlineRename() {
+    HWND lv = list_.Hwnd();
+    int row = list_.FocusedIndex();
+    if (row < 0 || ListView_GetItemState(lv, row, LVIS_SELECTED) == 0) row = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
+    auto r = list_.Results();
+    if (row < 0 || !r || !r->data) return;
+    ListView_EnsureVisible(lv, row, FALSE);
+    uint32_t id = r->items[static_cast<size_t>(row)];
+    renamePath_ = r->data->FullPath(id);
+    renameOrig_ = std::wstring(r->data->Name(id));
+    RECT rc = list_.NameTextRect(row);
+    renameEdit_ = CreateWindowExW(0, WC_EDITW, renameOrig_.c_str(), WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                                  rc.left, rc.top + 1, std::max<int>(rc.right - rc.left, Scale(120, DpiOf(hwnd_))), rc.bottom - rc.top - 2,
+                                  lv, nullptr, App::Instance(), nullptr);
+    SendMessageW(renameEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), FALSE);
+    SendMessageW(renameEdit_, EM_LIMITTEXT, 255, 0);
+    SetWindowSubclass(renameEdit_, RenameEditProc, 1, reinterpret_cast<DWORD_PTR>(this));
+    // 与资源管理器一致：文件只选中主名（不含扩展名）
+    size_t dot = renameOrig_.rfind(L'.');
+    bool dir = r->data->entries[id].IsDir();
+    SendMessageW(renameEdit_, EM_SETSEL, 0, (!dir && dot != std::wstring::npos && dot > 0) ? static_cast<LPARAM>(dot) : -1);
+    SetFocus(renameEdit_);
+}
+
+LRESULT CALLBACK MainWindow::RenameEditProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR ref) {
+    auto* self = reinterpret_cast<MainWindow*>(ref);
+    switch (m) {
+    case WM_GETDLGCODE: return DLGC_WANTALLKEYS;
+    case WM_KEYDOWN:
+        if (w == VK_RETURN) { self->EndInlineRename(true); return 0; }
+        if (w == VK_ESCAPE) { self->EndInlineRename(false); return 0; }
+        break;
+    case WM_CHAR: if (w == L'\r' || w == 27) return 0; break;
+    case WM_KILLFOCUS: if (!self->renameEnding_) PostMessageW(self->hwnd_, WM_COMMAND, IDM_RENAME_COMMIT, 0); break;   // 点到别处 = 提交
+    case WM_NCDESTROY: RemoveWindowSubclass(h, RenameEditProc, 1); break;
+    }
+    return DefSubclassProc(h, m, w, l);
+}
+
+void MainWindow::EndInlineRename(bool commit) {
+    if (!renameEdit_ || renameEnding_) return;
+    renameEnding_ = true;
+    int n = GetWindowTextLengthW(renameEdit_);
+    std::wstring nn(static_cast<size_t>(n), L'\0'); if (n) GetWindowTextW(renameEdit_, nn.data(), n + 1);
+    HWND e = renameEdit_;
+    bool hadFocus = GetFocus() == e;
+    renameEdit_ = nullptr;
+    DestroyWindow(e);
+    if (hadFocus) SetFocus(list_.Hwnd());
+    renameEnding_ = false;
+    if (!commit || nn == renameOrig_) return;
+    if (!ValidFileName(nn)) { MessageBoxW(hwnd_, L"文件名不能为空，也不能包含下列字符：\n\\ / : * ? \" < > |", kAppName, MB_ICONWARNING); return; }
+    std::wstring err;
+    if (!RenameItems(hwnd_, {{renamePath_, nn}}, err) && !err.empty() && err != L"操作被取消")
+        MessageBoxW(hwnd_, (L"重命名失败：\n" + err).c_str(), kAppName, MB_ICONWARNING);
+}
+
+void MainWindow::Delete(bool permanent) {
+    auto paths = SelectedPaths();
+    if (paths.empty()) return;
+    if (permanent) {
+        std::wstring q = paths.size() == 1 ? L"确实要永久删除“" + paths[0] + L"”吗？\n\n此操作无法撤销。"
+                                           : L"确实要永久删除这 " + std::to_wstring(paths.size()) + L" 项吗？\n\n此操作无法撤销。";
+        if (MessageBoxW(hwnd_, q.c_str(), L"永久删除", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+    }
+    std::wstring err;
+    if (!DeleteItems(hwnd_, paths, permanent, err) && !err.empty() && err != L"操作被取消")
+        MessageBoxW(hwnd_, (L"删除失败：\n" + err).c_str(), kAppName, MB_ICONWARNING);
+}
+
+// ---------- 深色菜单栏 ----------
+// Windows 没有公开的深色菜单栏：拦截未公开的 UAH 消息自绘菜单栏（WM_UAHDRAWMENU / WM_UAHDRAWMENUITEM），
+// 并在 WM_NCPAINT / WM_NCACTIVATE 之后补画菜单栏下方那条 1px 浅色线。弹出菜单用 uxtheme 序号 135/136（SetPreferredAppMode / FlushMenuThemes）。
+namespace {
+constexpr UINT WM_UAHDRAWMENU = 0x0091, WM_UAHDRAWMENUITEM = 0x0092;
+union UAHMENUITEMMETRICS { struct { DWORD cx, cy; } rgsizeBar[2]; struct { DWORD cx, cy; } rgsizePopup[4]; };
+struct UAHMENUPOPUPMETRICS { DWORD rgcx[4]; DWORD fUpdateMaxWidths : 2; };
+struct UAHMENU { HMENU hmenu; HDC hdc; DWORD dwFlags; };
+struct UAHMENUITEM { int iPosition; UAHMENUITEMMETRICS umim; UAHMENUPOPUPMETRICS umpm; };
+struct UAHDRAWMENUITEM { DRAWITEMSTRUCT dis; UAHMENU um; UAHMENUITEM umi; };
+}
+
+bool MainWindow::DarkMenuBar(UINT m, WPARAM w, LPARAM l, LRESULT* out) {
+    auto& t = GetTheme();
+    if (!t.Dark()) return false;
+    const auto& p = t.P();
+    switch (m) {
+    case WM_UAHDRAWMENU: {
+        auto* um = reinterpret_cast<UAHMENU*>(l);
+        MENUBARINFO mbi{sizeof(mbi)};
+        if (!GetMenuBarInfo(hwnd_, OBJID_MENU, 0, &mbi)) return false;
+        RECT wr; GetWindowRect(hwnd_, &wr);
+        RECT rc = mbi.rcBar; OffsetRect(&rc, -wr.left, -wr.top);
+        rc.top -= 1;
+        HBRUSH b = CreateSolidBrush(p.bg); FillRect(um->hdc, &rc, b); DeleteObject(b);
+        *out = TRUE; return true;
+    }
+    case WM_UAHDRAWMENUITEM: {
+        auto* di = reinterpret_cast<UAHDRAWMENUITEM*>(l);
+        wchar_t text[256] = {};
+        MENUITEMINFOW mii{sizeof(mii)}; mii.fMask = MIIM_STRING; mii.dwTypeData = text; mii.cch = 255;
+        GetMenuItemInfoW(di->um.hmenu, static_cast<UINT>(di->umi.iPosition), TRUE, &mii);
+        UINT st = di->dis.itemState;
+        COLORREF bg = p.bg, fg = p.text;
+        if (st & (ODS_HOTLIGHT | ODS_SELECTED)) bg = p.hover;
+        if (st & (ODS_INACTIVE | ODS_GRAYED | ODS_DISABLED)) fg = p.text2;
+        HBRUSH b = CreateSolidBrush(bg); FillRect(di->um.hdc, &di->dis.rcItem, b); DeleteObject(b);
+        SetBkMode(di->um.hdc, TRANSPARENT); SetTextColor(di->um.hdc, fg);
+        DrawTextW(di->um.hdc, text, -1, &di->dis.rcItem, DT_CENTER | DT_SINGLELINE | DT_VCENTER | ((st & ODS_NOACCEL) ? DT_HIDEPREFIX : 0));
+        *out = TRUE; return true;
+    }
+    case WM_NCPAINT: case WM_NCACTIVATE: {
+        *out = DefWindowProcW(hwnd_, m, w, l);
+        MENUBARINFO mbi{sizeof(mbi)};
+        if (!GetMenuBarInfo(hwnd_, OBJID_MENU, 0, &mbi)) return true;
+        RECT cr; GetClientRect(hwnd_, &cr); MapWindowPoints(hwnd_, nullptr, reinterpret_cast<POINT*>(&cr), 2);
+        RECT wr; GetWindowRect(hwnd_, &wr); OffsetRect(&cr, -wr.left, -wr.top);
+        RECT line = cr; line.bottom = line.top; line.top -= 1;
+        HDC dc = GetWindowDC(hwnd_);
+        HBRUSH b = CreateSolidBrush(p.bg); FillRect(dc, &line, b); DeleteObject(b);
+        ReleaseDC(hwnd_, dc);
+        return true;
+    }
+    }
+    return false;
+}
+
 // ---------- 键盘 ----------
 bool MainWindow::PreTranslate(MSG& msg) {
     if (msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN) return false;
+    if (renameEdit_ && msg.hwnd == renameEdit_) return false;   // 就地重命名编辑框自己处理按键
     if (msg.hwnd != hwnd_ && GetParent(msg.hwnd) != hwnd_ && GetParent(GetParent(msg.hwnd)) != hwnd_) return false;
     bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0, alt = GetKeyState(VK_MENU) < 0;
     WPARAM k = msg.wParam;
@@ -600,6 +771,7 @@ bool MainWindow::PreTranslate(MSG& msg) {
     if (ctrl && k == 'Q') { DestroyWindow(hwnd_); return true; }
     if (ctrl && k == 'P') { PostMessageW(hwnd_, WM_COMMAND, IDM_OPTIONS, 0); return true; }
     if (ctrl && k == 'W') { HideToTray(); return true; }
+    if (ctrl && !shift && k == 'R') { PostMessageW(hwnd_, WM_COMMAND, IDM_REGEX, 0); return true; }
 
     if (msg.hwnd == edit_) {
         if (ctrl && k == 'A') { SendMessageW(edit_, EM_SETSEL, 0, -1); return true; }
@@ -617,6 +789,8 @@ bool MainWindow::PreTranslate(MSG& msg) {
         if (k == VK_RETURN && alt) { ShowProperties(); return true; }
         if (k == VK_RETURN) { OpenItems(ctrl); return true; }
         if (ctrl && shift && k == 'C') { CopyPaths(false); return true; }
+        if (k == VK_F2 && !ctrl && !alt) { Rename(); return true; }
+        if (k == VK_DELETE && !ctrl && !alt) { Delete(shift); return true; }
         if (ctrl && k == 'A') { ListView_SetItemState(lv, -1, LVIS_SELECTED, LVIS_SELECTED); return true; }
         if (k == VK_UP && ListView_GetNextItem(lv, -1, LVNI_FOCUSED) == 0 && !shift) { SetFocus(edit_); return true; }
         if (k == VK_APPS || (shift && k == VK_F10)) {
@@ -639,6 +813,7 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         if (cm2_ && SUCCEEDED(cm2_->HandleMenuMsg(m, w, l))) return m == WM_INITMENUPOPUP ? 0 : TRUE;
     }
     if (m == taskbarCreated_ && taskbarCreated_) { tray_.Add(hwnd_, iconSmall_); return 0; }
+    { LRESULT r = 0; if (DarkMenuBar(m, w, l, &r)) return r; }
     switch (m) {
     case WM_CREATE: OnCreate(); return 0;
     case WM_SIZE: Layout(); return 0;
@@ -703,6 +878,15 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         }
         case IDM_INSTALL_SVC: case IDC_SVC_BTN: ServiceAction(true); break;
         case IDM_UNINSTALL_SVC: ServiceAction(false); break;
+        case IDM_RENAME: Rename(); break;
+        case IDM_RENAME_COMMIT: EndInlineRename(true); break;
+        case IDM_DELETE: Delete(false); break;
+        case IDM_DELETE_PERM: Delete(true); break;
+        case IDM_COL_PATH: case IDM_COL_SIZE: case IDM_COL_DATE: {
+            int c = id - IDM_COL_PATH + 1; list_.SetColumnVisible(c, !list_.ColumnVisible(c)); ApplyTheme(); break;
+        }
+        case IDM_REGEX:
+            GetSettings().matchRegex = !GetSettings().matchRegex; ApplyTheme(); RunSearch(); break;
         case IDM_DOUBLE_CTRL:
             GetSettings().doubleCtrl = !GetSettings().doubleCtrl;
             if (GetSettings().doubleCtrl) hotkeys_.EnableDoubleCtrl(hwnd_); else hotkeys_.DisableDoubleCtrl();
@@ -729,6 +913,11 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         if (nm->hwndFrom == list_.Hwnd()) {
             if (nm->code == NM_DBLCLK) { OpenItems(false); return 0; }
             if (nm->code == NM_RCLICK) { POINT pt; GetCursorPos(&pt); ContextMenu(pt); return 0; }
+            if (nm->code == LVN_BEGINDRAG || nm->code == LVN_BEGINRDRAG) {   // 拖出：CF_HDROP + Shell IDList
+                auto paths = SelectedPaths();
+                if (!paths.empty()) DragOut(hwnd_, paths);
+                return 0;
+            }
             if (nm->code == LVN_ITEMCHANGED || nm->code == LVN_ODSTATECHANGED) UpdateStatus();
         }
         if (list_.OnNotify(nm, &out)) return out;
