@@ -28,6 +28,7 @@ HWND ResultList::Create(HWND parent, int id) {
     UINT dpi = DpiOf(parent);
     struct { const wchar_t* t; int w; int fmt; } cols[] = {
         {L"名称", s.colName, LVCFMT_LEFT}, {L"路径", s.colPath, LVCFMT_LEFT},
+        {L"扩展名", s.colExt, LVCFMT_LEFT},
         {L"大小", s.colSize, LVCFMT_RIGHT}, {L"修改时间", s.colDate, LVCFMT_LEFT}};
     for (int i = 0; i < ColCount; ++i) {
         LVCOLUMNW c{LVCF_TEXT | LVCF_WIDTH | LVCF_FMT};
@@ -72,7 +73,7 @@ bool ResultList::GetSettingsVisible(int c) { return c <= 0 || c >= ColCount || G
 void ResultList::UpdateHiddenColumns() {
     HWND hdr = ListView_GetHeader(hwnd_);
     auto& s = GetSettings();
-    int saved[ColCount] = {s.colName, s.colPath, s.colSize, s.colDate};
+    int saved[ColCount] = {s.colName, s.colPath, s.colExt, s.colSize, s.colDate};
     UINT dpi = DpiOf(hwnd_);
     for (int c = 1; c < ColCount; ++c) {
         bool vis = s.colVisible[c];
@@ -91,7 +92,10 @@ void ResultList::SetColumnVisible(int c, bool v) {
     auto& s = GetSettings();
     if (!v) {   // 记住当前宽度
         int w = MulDiv(ListView_GetColumnWidth(hwnd_, c), 96, static_cast<int>(DpiOf(hwnd_)));
-        if (w > 0) { if (c == ColPath) s.colPath = w; else if (c == ColSize) s.colSize = w; else s.colDate = w; }
+        if (w > 0) {
+            if (c == ColPath) s.colPath = w; else if (c == ColExt) s.colExt = w;
+            else if (c == ColSize) s.colSize = w; else if (c == ColDate) s.colDate = w;
+        }
     }
     s.colVisible[c] = v;
     UpdateHiddenColumns();
@@ -99,7 +103,7 @@ void ResultList::SetColumnVisible(int c, bool v) {
 
 void ResultList::ColumnMenu(POINT pt) {
     HMENU m = CreatePopupMenu();
-    const wchar_t* names[] = {L"名称", L"路径", L"大小", L"修改时间"};
+    const wchar_t* names[] = {L"名称", L"路径", L"扩展名", L"大小", L"修改时间"};
     for (int c = 0; c < ColCount; ++c)
         AppendMenuW(m, MF_STRING | (ColumnVisible(c) ? MF_CHECKED : 0) | (c == ColName ? MF_GRAYED : 0), 1 + c, names[c]);
     int cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd_, nullptr);
@@ -211,7 +215,7 @@ std::vector<int> ResultList::ColumnWidths() const {
     std::vector<int> w;
     UINT dpi = DpiOf(hwnd_);
     auto& s = GetSettings();
-    int saved[ColCount] = {s.colName, s.colPath, s.colSize, s.colDate};
+    int saved[ColCount] = {s.colName, s.colPath, s.colExt, s.colSize, s.colDate};
     for (int i = 0; i < ColCount; ++i) w.push_back(ColumnVisible(i) ? MulDiv(ListView_GetColumnWidth(hwnd_, i), 96, static_cast<int>(dpi)) : saved[i]);
     return w;
 }
@@ -371,8 +375,16 @@ void ResultList::DrawRow(HDC dc, int row, const RECT& rr, const RECT* cols, bool
         }
         int len = 0;
         if (c == ColPath) len = static_cast<int>(d.ParentPathInto(i, rowBuf_, kRowBuf));
-        else if (c == ColSize) len = e.IsDir() ? 0 : FormatSizeInto(e.size, rowBuf_, kRowBuf);
-        else len = FormatTimeInto(e.mtime, rowBuf_, kRowBuf);
+        else if (c == ColExt) {
+            if (!e.IsDir()) {
+                auto nm = d.Name(i); size_t dot = nm.rfind(L'.');
+                if (dot != std::wstring_view::npos && dot + 1 < nm.size()) {
+                    size_t n = std::min(nm.size() - dot - 1, kRowBuf - 1);
+                    wmemcpy(rowBuf_, nm.data() + dot + 1, n); rowBuf_[n] = 0; len = static_cast<int>(n);
+                }
+            }
+        } else if (c == ColSize) len = e.IsDir() ? 0 : FormatSizeInto(e.size, rowBuf_, kRowBuf);
+        else if (c == ColDate) len = FormatTimeInto(e.mtime, rowBuf_, kRowBuf);
         RECT t{r.left + pad, r.top, r.right - pad, r.bottom};
         SetTextColor(dc, pal.text2);
         DrawTextW(dc, rowBuf_, len, &t, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS | (c == ColSize ? DT_RIGHT : DT_LEFT));
@@ -438,6 +450,17 @@ bool ResultList::OnNotify(NMHDR* nm, LRESULT* out) {
             switch (di->item.iSubItem) {
             case ColName: { auto nv = d.Name(i); size_t c = std::min(nv.size(), cap - 1); wmemcpy(o, nv.data(), c); o[c] = 0; break; }
             case ColPath: d.ParentPathInto(i, o, cap); break;
+            case ColExt: {
+                o[0] = 0;
+                if (!d.entries[i].IsDir()) {
+                    auto nm = d.Name(i); size_t dot = nm.rfind(L'.');
+                    if (dot != std::wstring_view::npos && dot + 1 < nm.size()) {
+                        size_t n = std::min(nm.size() - dot - 1, cap - 1);
+                        wmemcpy(o, nm.data() + dot + 1, n); o[n] = 0;
+                    }
+                }
+                break;
+            }
             case ColSize: if (d.entries[i].IsDir()) o[0] = 0; else FormatSizeInto(d.entries[i].size, o, cap); break;
             case ColDate: FormatTimeInto(d.entries[i].mtime, o, cap); break;
             }

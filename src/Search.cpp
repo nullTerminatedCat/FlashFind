@@ -25,18 +25,37 @@ std::vector<std::wstring> ParseTerms(const std::wstring& query) {
 // 含 * 或 ? 的词匹配整个名称（含 \ 时匹配完整路径），锚定首尾；不含通配符的词仍为子串匹配。
 // 每次搜索只编译一次；常见形态走无回溯快速路径。
 namespace {
-enum class PatKind : uint8_t { Substr, All, Exact, Prefix, Suffix, PrefixSuffix, Glob };
+enum class PatKind : uint8_t { Substr, All, Exact, Prefix, Suffix, PrefixSuffix, Glob, WholeWord };
 struct Pattern {
     PatKind kind = PatKind::Substr;
-    std::wstring a, b;       // Exact/Prefix: a；Suffix: b；PrefixSuffix: a+b；Substr: a；Glob: a = 规范化模式（连续 * 合并）
-    bool ascii = false, path = false;
+    std::wstring a, b;       // Exact/Prefix: a；Suffix: b；PrefixSuffix: a+b；Substr/WholeWord: a；Glob: a
+    bool ascii = false, path = false, caseSens = false;
 };
+
+inline bool IsWord(wchar_t c) {
+    return (c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') || c >= 0x80;
+}
 
 template <bool A> inline wchar_t F(wchar_t c) { if constexpr (A) return FoldA(c); else return Fold(c); }
 
-template <bool A> inline bool EqAt(const wchar_t* s, std::wstring_view lit) {
-    for (size_t k = 0; k < lit.size(); ++k) if (F<A>(s[k]) != lit[k]) return false;
+template <bool A> inline bool EqAt(const wchar_t* s, std::wstring_view lit, bool caseSens) {
+    for (size_t k = 0; k < lit.size(); ++k) {
+        wchar_t a = s[k], b = lit[k];
+        if (caseSens ? a != b : F<A>(a) != b) return false;
+    }
     return true;
+}
+
+template <bool A> bool WholeWordMatch(std::wstring_view s, std::wstring_view lit, bool caseSens) {
+    if (lit.empty()) return true;
+    if (lit.size() > s.size()) return false;
+    for (size_t i = 0; i + lit.size() <= s.size(); ++i) {
+        if (!EqAt<A>(s.data() + i, lit, caseSens)) continue;
+        bool L = i == 0 || !IsWord(s[i - 1]);
+        bool R = i + lit.size() == s.size() || !IsWord(s[i + lit.size()]);
+        if (L && R) return true;
+    }
+    return false;
 }
 
 // 迭代式贪心 + 单回溯点（无递归）：最坏 O(n*m)，常见情况线性
@@ -53,12 +72,18 @@ template <bool A> bool GlobMatch(std::wstring_view s, std::wstring_view p) {
     return j == m;
 }
 
-Pattern Compile(const std::wstring& t) {
+Pattern Compile(const std::wstring& t, bool caseSens = false, bool wholeWord = false) {
     Pattern p;
-    p.path = t.find(L'\\') != std::wstring::npos;
-    p.ascii = g_fastAscii && IsAscii(t);
-    if (t.find_first_of(L"*?") == std::wstring::npos) { p.kind = PatKind::Substr; p.a = t; return p; }
-    std::wstring g; for (wchar_t c : t) if (!(c == L'*' && !g.empty() && g.back() == L'*')) g += c;   // ** -> *
+    p.caseSens = caseSens;
+    std::wstring src = t;
+    if (!caseSens) for (auto& c : src) c = Fold(c);
+    p.path = src.find(L'\\') != std::wstring::npos;
+    p.ascii = g_fastAscii && IsAscii(src);
+    if (src.find_first_of(L"*?") == std::wstring::npos) {
+        p.kind = wholeWord ? PatKind::WholeWord : PatKind::Substr;
+        p.a = std::move(src); return p;
+    }
+    std::wstring g; for (wchar_t c : src) if (!(c == L'*' && !g.empty() && g.back() == L'*')) g += c;   // ** -> *
     if (g == L"*") { p.kind = PatKind::All; return p; }
     if (g.find(L'?') == std::wstring::npos) {
         size_t stars = std::count(g.begin(), g.end(), L'*');
@@ -76,15 +101,22 @@ Pattern Compile(const std::wstring& t) {
 }
 
 template <bool A> inline bool MatchT(std::wstring_view s, const Pattern& p) {
+    const bool cs = p.caseSens;
     switch (p.kind) {
     case PatKind::All: return true;
-    case PatKind::Substr: if constexpr (A) return ContainsFoldAscii(s, p.a); else return ContainsFold(s, p.a);
-    case PatKind::Exact: return s.size() == p.a.size() && EqAt<A>(s.data(), p.a);
-    case PatKind::Prefix: return s.size() >= p.a.size() && EqAt<A>(s.data(), p.a);
-    case PatKind::Suffix: return s.size() >= p.b.size() && EqAt<A>(s.data() + s.size() - p.b.size(), p.b);
+    case PatKind::Substr:
+        if (cs) {
+            for (size_t i = 0; i + p.a.size() <= s.size(); ++i) if (EqAt<A>(s.data() + i, p.a, true)) return true;
+            return false;
+        }
+        if constexpr (A) return ContainsFoldAscii(s, p.a); else return ContainsFold(s, p.a);
+    case PatKind::WholeWord: return WholeWordMatch<A>(s, p.a, cs);
+    case PatKind::Exact: return s.size() == p.a.size() && EqAt<A>(s.data(), p.a, cs);
+    case PatKind::Prefix: return s.size() >= p.a.size() && EqAt<A>(s.data(), p.a, cs);
+    case PatKind::Suffix: return s.size() >= p.b.size() && EqAt<A>(s.data() + s.size() - p.b.size(), p.b, cs);
     case PatKind::PrefixSuffix:
-        return s.size() >= p.a.size() + p.b.size() && EqAt<A>(s.data() + s.size() - p.b.size(), p.b) && EqAt<A>(s.data(), p.a);
-    case PatKind::Glob: return GlobMatch<A>(s, p.a);
+        return s.size() >= p.a.size() + p.b.size() && EqAt<A>(s.data() + s.size() - p.b.size(), p.b, cs) && EqAt<A>(s.data(), p.a, cs);
+    case PatKind::Glob: return GlobMatch<A>(s, p.a);  // Glob 模式内容已按 caseSens 折叠或原样
     }
     return false;
 }
@@ -104,7 +136,7 @@ struct RegexProg {
     ~RegexProg() { if (code) pcre2_code_free_16(code); }
 };
 struct QNode {
-    enum Kind : uint8_t { And, Or, Not, Pat, Ext, Size, Date, IsFile, IsDir, Regex } kind;
+    enum Kind : uint8_t { And, Or, Not, Pat, Ext, Size, Date, IsFile, IsDir, Regex, Parent, Depth } kind;
     std::shared_ptr<RegexProg> re;
     std::vector<uint32_t> kids;
     Pattern pat;
@@ -119,6 +151,7 @@ struct Query {
     bool everything = true;   // 空查询或全部为 *
     bool hasRegex = false;
     std::wstring error;
+    MatchOpts opts;
 };
 
 namespace {
@@ -241,7 +274,7 @@ bool SizeUnit(std::wstring_view v, uint64_t& a, uint64_t& b) {
 
 class Parser {
 public:
-    Parser(Query& q, std::vector<std::wstring> t) : q_(q), t_(std::move(t)) {}
+    Parser(Query& q, std::vector<std::wstring> t) : q_(q), t_(std::move(t)), opts_(q.opts) {}
     int ParseAnd() {
         std::vector<uint32_t> kids;
         while (pos_ < t_.size() && t_[pos_] != L">") {
@@ -297,21 +330,50 @@ private:
             if (fn == L"file" || fn == L"folder") {
                 int f = AddNode(QNode{fn == L"file" ? QNode::IsFile : QNode::IsDir});
                 if (arg.empty()) return f;
-                int pnode = PatLeaf(arg, false, neg);
+                int pnode = PatLeaf(arg, false, neg, false);
                 return Add(QNode::And, {static_cast<uint32_t>(f), static_cast<uint32_t>(pnode)});
             }
-            if (fn == L"path") return PatLeaf(arg, true, neg);
+            if (fn == L"path") return PatLeaf(arg, true, neg, false);
+            if (fn == L"nopath") return PatLeaf(arg, false, neg, true);   // 强制只匹配名称
+            if (fn == L"startwith" || fn == L"startswith") {
+                QNode nd{}; nd.kind = QNode::Pat; nd.pat = Compile(arg, opts_.matchCase, false);
+                nd.pat.kind = PatKind::Prefix; if (opts_.matchPath) nd.pat.path = true; nd.needPath = nd.pat.path;
+                q_.everything = false; if (!neg) q_.highlight.push_back(nd.pat.a); return AddNode(std::move(nd));
+            }
+            if (fn == L"endwith" || fn == L"endswith") {
+                QNode nd{}; nd.kind = QNode::Pat; nd.pat = Compile(arg, opts_.matchCase, false);
+                nd.pat.kind = PatKind::Suffix; nd.pat.b = nd.pat.a; nd.pat.a.clear();
+                if (opts_.matchPath) nd.pat.path = true; nd.needPath = nd.pat.path;
+                q_.everything = false; if (!neg) q_.highlight.push_back(nd.pat.b); return AddNode(std::move(nd));
+            }
+            if (fn == L"exact" || fn == L"wholefilename" || fn == L"wholefile") {
+                QNode nd{}; nd.kind = QNode::Pat; nd.pat = Compile(arg, opts_.matchCase, false);
+                nd.pat.kind = PatKind::Exact; if (opts_.matchPath) nd.pat.path = true; nd.needPath = nd.pat.path;
+                q_.everything = false; if (!neg) q_.highlight.push_back(nd.pat.a); return AddNode(std::move(nd));
+            }
+            if (fn == L"parent" || fn == L"infolder") {
+                QNode nd{}; nd.kind = QNode::Parent; nd.pat = Compile(arg, opts_.matchCase, opts_.matchWholeWord);
+                q_.everything = false; nd.needPath = false; return AddNode(std::move(nd));
+            }
+            if (fn == L"depth" || fn == L"parents") {
+                QNode nd{}; nd.kind = QNode::Depth;
+                auto unit = [](std::wstring_view v, uint64_t& a, uint64_t& b) -> bool {
+                    uint64_t x = 0; for (wchar_t c : v) { if (c < L'0' || c > L'9') return false; x = x * 10 + (c - L'0'); }
+                    a = x; b = x + 1; return true;
+                };
+                if (ParseRange(arg, unit, nd.lo, nd.hi)) { q_.everything = false; nd.needPath = true; return AddNode(std::move(nd)); }
+            }
             if (fn == L"regex") return RegexLeaf(arg);
         }
-        return PatLeaf(tok, false, neg);
+        return PatLeaf(tok, false, neg, false);
     }
 public:
     // 匹配名称；正则含 \\（转义的反斜杠）时匹配完整路径
     int RegexLeaf(const std::wstring& pat) {
         QNode nd{}; nd.kind = QNode::Regex; nd.re = std::make_shared<RegexProg>();
         int ec = 0; PCRE2_SIZE eo = 0;
-        nd.re->code = pcre2_compile_16(reinterpret_cast<PCRE2_SPTR16>(pat.c_str()), pat.size(),
-                                       PCRE2_CASELESS | PCRE2_UTF | PCRE2_MATCH_INVALID_UTF, &ec, &eo, nullptr);
+        uint32_t fl = PCRE2_UTF | PCRE2_MATCH_INVALID_UTF | (opts_.matchCase ? 0 : PCRE2_CASELESS);
+        nd.re->code = pcre2_compile_16(reinterpret_cast<PCRE2_SPTR16>(pat.c_str()), pat.size(), fl, &ec, &eo, nullptr);
         if (!nd.re->code) {
             PCRE2_UCHAR16 msg[256] = {}; pcre2_get_error_message_16(ec, msg, 256);
             wchar_t b[64]; swprintf_s(b, L"（位置 %zu）", static_cast<size_t>(eo));
@@ -324,18 +386,19 @@ public:
         return AddNode(std::move(nd));
     }
 private:
-    int PatLeaf(const std::wstring& raw, bool forcePath, bool neg) {
-        std::wstring t = FoldStr(raw);
-        QNode nd{}; nd.kind = QNode::Pat; nd.pat = Compile(t);
-        if (forcePath) nd.pat.path = true;
+    int PatLeaf(const std::wstring& raw, bool forcePath, bool neg, bool forceNoPath) {
+        QNode nd{}; nd.kind = QNode::Pat;
+        nd.pat = Compile(raw, opts_.matchCase, opts_.matchWholeWord && raw.find_first_of(L"*?") == std::wstring::npos);
+        if (forcePath || (opts_.matchPath && !forceNoPath)) nd.pat.path = true;
+        if (forceNoPath) nd.pat.path = false;
         nd.needPath = nd.pat.path;
         if (nd.pat.kind != PatKind::All) q_.everything = false;
-        if (!neg) q_.highlight.push_back(t);
+        if (!neg) q_.highlight.push_back(nd.pat.a.empty() ? nd.pat.b : nd.pat.a);
         return AddNode(std::move(nd));
     }
     int AddNode(QNode n) { if (n.kind != QNode::Pat) q_.everything = false; q_.nodes.push_back(std::move(n)); return static_cast<int>(q_.nodes.size() - 1); }
     int Add(QNode::Kind k, std::vector<uint32_t> kids) { QNode n{}; n.kind = k; n.kids = std::move(kids); return AddNode(std::move(n)); }
-    Query& q_; std::vector<std::wstring> t_; size_t pos_ = 0;
+    Query& q_; std::vector<std::wstring> t_; MatchOpts opts_; size_t pos_ = 0;
 };
 
 // 子树是否需要完整路径；AND/OR 子项把便宜的排前面
@@ -385,15 +448,26 @@ bool Eval(const Query& q, uint32_t ni, EvalCtx& c) {
         }
         return false;
     }
+    case QNode::Parent: {
+        if (e.parent == kNoParent) return Match(std::wstring_view{}, n.pat);  // 卷根：空父名
+        return Match(c.d.Name(e.parent), n.pat);
+    }
+    case QNode::Depth: {
+        // 深度 = 完整路径中 \ 的个数（T: 为 0，T:\Docs 为 1）
+        auto fp = c.Full();
+        uint64_t dpt = 0; for (wchar_t ch : fp) if (ch == L'\\') ++dpt;
+        return dpt >= n.lo && dpt <= n.hi;
+    }
     }
     return false;
 }
 } // namespace
 
-std::shared_ptr<Query> CompileQuery(const std::wstring& text, bool regexMode, const std::wstring& extra) {
+std::shared_ptr<Query> CompileQuery(const std::wstring& text, MatchOpts opts, const std::wstring& extra) {
     InitFold();
     auto q = std::make_shared<Query>();
-    if (regexMode) {
+    q->opts = opts;
+    if (opts.matchRegex) {
         std::vector<uint32_t> kids;
         if (!text.empty()) { Parser rp(*q, {}); kids.push_back(static_cast<uint32_t>(rp.RegexLeaf(text))); q->everything = false; }
         if (!extra.empty()) { Parser ep(*q, Tokenize(extra)); int r = ep.ParseAnd(); if (r >= 0) kids.push_back(static_cast<uint32_t>(r)); }
@@ -402,7 +476,8 @@ std::shared_ptr<Query> CompileQuery(const std::wstring& text, bool regexMode, co
         if (q->root >= 0) { q->everything = false; Prepare(*q, static_cast<uint32_t>(q->root)); } else q->everything = true;
         return q;
     }
-    Parser p(*q, Tokenize(extra.empty() ? text : (text.find_first_not_of(L" \t") == std::wstring::npos ? extra : L"<" + text + L"> " + extra)));
+    std::wstring combined = extra.empty() ? text : (text.find_first_not_of(L" \t") == std::wstring::npos ? extra : L"<" + text + L"> " + extra);
+    Parser p(*q, Tokenize(combined));
     q->root = p.ParseAnd();
     if (q->hasRegex) q->everything = false;
     if (q->root >= 0) Prepare(*q, static_cast<uint32_t>(q->root));
@@ -515,9 +590,20 @@ void SortItems(const IndexData& d, std::vector<uint32_t>& items, SortSpec s, con
             uint32_t i = items[k]; const Entry& en = d.entries[i];
             uint64_t key;
             switch (s.col) {
-            case SortCol::Size: key = en.IsDir() ? 0 : en.size + 1; break;     // 文件夹排在最小处
+            case SortCol::Size: key = en.IsDir() ? 0 : en.size + 1; break;
             case SortCol::Date: key = en.mtime; break;
             case SortCol::Name: key = namePos[i]; break;
+            case SortCol::Ext: {
+                // 键：扩展名折叠序（按字符打包进 uint64，超过的截断；同扩展名保持原序）
+                auto nm = d.Name(i);
+                size_t dot = en.IsDir() ? std::wstring_view::npos : nm.rfind(L'.');
+                uint64_t h = 0;
+                if (dot != std::wstring_view::npos && dot + 1 < nm.size()) {
+                    for (size_t k = dot + 1; k < nm.size() && k < dot + 1 + 8; ++k) h = (h << 8) | (Fold(nm[k]) & 0xFF);
+                }
+                key = h;
+                break;
+            }
             default: key = en.parent == kNoParent || !folderRank ? 0 : (*folderRank)[en.parent]; break;
             }
             v[k] = {desc ? ~key : key, static_cast<uint32_t>(k), i};
@@ -553,9 +639,9 @@ Searcher::~Searcher() {
     th_.join();
 }
 
-void Searcher::Request(const std::wstring& query, std::shared_ptr<const IndexData> data, SortSpec sort, bool regex, std::wstring filter) {
+void Searcher::Request(const std::wstring& query, std::shared_ptr<const IndexData> data, SortSpec sort, MatchOpts opts, std::wstring filter) {
     if (!data) return;
-    { std::lock_guard lk(mu_); query_ = query; filter_ = std::move(filter); regex_ = regex; data_ = std::move(data); sort_ = sort; pending_ = true; ++gen_; }
+    { std::lock_guard lk(mu_); query_ = query; filter_ = std::move(filter); opts_ = opts; data_ = std::move(data); sort_ = sort; pending_ = true; ++gen_; }
     cv_.notify_all();
 }
 
@@ -563,19 +649,21 @@ std::shared_ptr<SearchResult> Searcher::Latest() { std::lock_guard lk(mu_); retu
 
 void Searcher::Loop() {
     for (;;) {
-        std::wstring q, flt; bool rx; std::shared_ptr<const IndexData> d; uint64_t g; SortSpec so;
+        std::wstring q, flt; MatchOpts ox; std::shared_ptr<const IndexData> d; uint64_t g; SortSpec so;
         {
             std::unique_lock lk(mu_);
             cv_.wait(lk, [&] { return quit_ || pending_; });
             if (quit_) return;
-            pending_ = false; q = query_; flt = filter_; rx = regex_; d = data_; g = gen_; so = sort_;
+            pending_ = false; q = query_; flt = filter_; ox = opts_; d = data_; g = gen_; so = sort_;
         }
         if (!d) continue;
         auto t0 = std::chrono::steady_clock::now();
         auto res = std::make_shared<SearchResult>();
-        auto cq = CompileQuery(q, rx, flt);
+        auto cq = CompileQuery(q, ox, flt);
         res->generation = g; res->data = d; res->terms = cq->highlight; res->sort = so; res->error = cq->error;
-        q = (rx ? L"\x02" : L"\x03") + flt + L"\x04" + q;   // 复用判断的键
+        // 复用键：选项变化也必须重搜
+        wchar_t ob[8]; swprintf_s(ob, L"%d%d%d%d", ox.matchCase, ox.matchWholeWord, ox.matchPath, ox.matchRegex);
+        q = std::wstring(ob) + L"\x04" + flt + L"\x05" + q;
         if (d == lastD_ && q == lastQ_) res->items = lastItems_;   // 只改了排序
         else {
             if (!SearchQuery(*d, *cq, res->items, [&] { return gen_ != g; })) continue;

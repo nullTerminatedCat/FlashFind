@@ -3,6 +3,8 @@
 #include "NtfsSource.h"
 #include "Options.h"
 #include "FileOps.h"
+#include "History.h"
+#include "ShellInstall.h"
 #include <shellapi.h>
 #include <algorithm>
 #include "Dpi.h"
@@ -26,8 +28,11 @@ enum : int {
     IDM_UNINSTALL_SVC,
     IDC_SVC_BTN,
     IDM_OPTIONS,
-    IDM_REGEX,
-    IDM_RENAME, IDM_RENAME_COMMIT, IDM_DELETE, IDM_DELETE_PERM, IDM_COL_PATH, IDM_COL_SIZE, IDM_COL_DATE,
+    IDM_REGEX, IDM_CASE, IDM_WHOLEWORD, IDM_MATCHPATH,
+    IDM_RENAME, IDM_RENAME_COMMIT, IDM_DELETE, IDM_DELETE_PERM, IDM_CUT, IDM_COPY_FILES, IDM_PASTE,
+    IDM_COPY_TO, IDM_MOVE_TO, IDM_CLEAR_HISTORY, IDM_HISTORY_ENABLE,
+    IDM_COL_PATH, IDM_COL_EXT, IDM_COL_SIZE, IDM_COL_DATE,
+    IDM_INSTALL_URL, IDM_UNINSTALL_URL, IDM_INSTALL_FOLDER_CM, IDM_UNINSTALL_FOLDER_CM,
 };
 
 // 过滤器（与 Everything 默认过滤器相同的扩展名表）
@@ -175,15 +180,27 @@ void MainWindow::BuildMenu() {
     AppendMenuW(theme, MF_STRING, IDM_THEME_DARK, L"深色");
     HMENU cols = CreatePopupMenu();
     AppendMenuW(cols, MF_STRING, IDM_COL_PATH, L"路径(&P)");
+    AppendMenuW(cols, MF_STRING, IDM_COL_EXT, L"扩展名(&E)");
     AppendMenuW(cols, MF_STRING, IDM_COL_SIZE, L"大小(&S)");
     AppendMenuW(cols, MF_STRING, IDM_COL_DATE, L"修改时间(&M)");
     AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(cols), L"列(&C)");
     AppendMenuW(view, MF_POPUP, reinterpret_cast<UINT_PTR>(theme), L"主题(&T)");
     HMENU search = CreatePopupMenu();
-    AppendMenuW(search, MF_STRING, IDM_REGEX, L"启用正则表达式(&R)\tCtrl+R");
+    AppendMenuW(search, MF_STRING, IDM_CASE, L"区分大小写(&C)\tCtrl+I");
+    AppendMenuW(search, MF_STRING, IDM_WHOLEWORD, L"全字匹配(&W)\tCtrl+B");
+    AppendMenuW(search, MF_STRING, IDM_MATCHPATH, L"匹配路径(&P)\tCtrl+U");
+    AppendMenuW(search, MF_STRING, IDM_REGEX, L"正则表达式(&R)\tCtrl+R");
+    AppendMenuW(search, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(search, MF_STRING, IDM_HISTORY_ENABLE, L"启用搜索历史");
+    AppendMenuW(search, MF_STRING, IDM_CLEAR_HISTORY, L"清空搜索历史");
     HMENU tools = CreatePopupMenu();
     AppendMenuW(tools, MF_STRING, IDM_DOUBLE_CTRL, L"双击 Ctrl 显示/隐藏");
     AppendMenuW(tools, MF_STRING, IDM_OPTIONS, L"选项(&O)…\tCtrl+P");
+    AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(tools, MF_STRING, IDM_INSTALL_URL, L"安装 es: 协议");
+    AppendMenuW(tools, MF_STRING, IDM_UNINSTALL_URL, L"卸载 es: 协议");
+    AppendMenuW(tools, MF_STRING, IDM_INSTALL_FOLDER_CM, L"安装文件夹右键菜单");
+    AppendMenuW(tools, MF_STRING, IDM_UNINSTALL_FOLDER_CM, L"卸载文件夹右键菜单");
     AppendMenuW(tools, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(tools, MF_STRING, IDM_INSTALL_SVC, L"安装 FlashFind 服务(&I)…");
     AppendMenuW(tools, MF_STRING, IDM_UNINSTALL_SVC, L"卸载 FlashFind 服务(&U)…");
@@ -228,8 +245,18 @@ void MainWindow::ApplyTheme() {
     HMENU bar = GetMenu(hwnd_);
     int sel = IDM_THEME_SYSTEM + static_cast<int>(GetSettings().theme);
     CheckMenuRadioItem(bar, IDM_THEME_SYSTEM, IDM_THEME_DARK, sel, MF_BYCOMMAND);
-    for (int c = 1; c < ColCount; ++c) CheckMenuItem(bar, IDM_COL_PATH + c - 1, MF_BYCOMMAND | (list_.ColumnVisible(c) ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuItem(bar, IDM_REGEX, MF_BYCOMMAND | (GetSettings().matchRegex ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_COL_PATH, MF_BYCOMMAND | (list_.ColumnVisible(ColPath) ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_COL_EXT, MF_BYCOMMAND | (list_.ColumnVisible(ColExt) ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_COL_SIZE, MF_BYCOMMAND | (list_.ColumnVisible(ColSize) ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_COL_DATE, MF_BYCOMMAND | (list_.ColumnVisible(ColDate) ? MF_CHECKED : MF_UNCHECKED));
+    auto& st = GetSettings();
+    CheckMenuItem(bar, IDM_CASE, MF_BYCOMMAND | (st.matchCase ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_WHOLEWORD, MF_BYCOMMAND | (st.matchWholeWord ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_MATCHPATH, MF_BYCOMMAND | (st.matchPath ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_REGEX, MF_BYCOMMAND | (st.matchRegex ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_HISTORY_ENABLE, MF_BYCOMMAND | (st.historyEnabled ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_INSTALL_URL, MF_BYCOMMAND | (UrlProtocolInstalled() ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_INSTALL_FOLDER_CM, MF_BYCOMMAND | (FolderContextMenuInstalled() ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(bar, IDM_DOUBLE_CTRL, MF_BYCOMMAND | (GetSettings().doubleCtrl ? MF_CHECKED : MF_UNCHECKED));
     DrawMenuBar(hwnd_);
     SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);   // 重画非客户区（菜单栏下方的线）
@@ -350,7 +377,9 @@ void MainWindow::RunSearch() {
     if (len) GetWindowTextW(edit_, q.data(), len + 1);
     int f = filter_ ? static_cast<int>(SendMessageW(filter_, CB_GETCURSEL, 0, 0)) : 0;
     std::wstring fx = f > 0 && f < static_cast<int>(std::size(kFilters)) ? kFilters[f].expr : L"";
-    searcher_->Request(q, std::move(snap), list_.Sort(), GetSettings().matchRegex, fx);
+    auto& st = GetSettings();
+    MatchOpts o; o.matchCase = st.matchCase; o.matchWholeWord = st.matchWholeWord; o.matchPath = st.matchPath; o.matchRegex = st.matchRegex;
+    searcher_->Request(q, std::move(snap), list_.Sort(), o, fx);
 }
 
 void MainWindow::UpdateTitle() {
@@ -374,7 +403,11 @@ void MainWindow::UpdateStatus() {
         }
         wchar_t ms[48]; swprintf_s(ms, L"  ·  %.0f ms", lastSearchMs_);
         s += ms;
-        if (GetSettings().matchRegex) s += L"  ·  正则";
+        auto& st = GetSettings();
+        if (st.matchCase) s += L"  ·  区分大小写";
+        if (st.matchWholeWord) s += L"  ·  全字";
+        if (st.matchPath) s += L"  ·  路径";
+        if (st.matchRegex) s += L"  ·  正则";
         if (!r->error.empty()) s = L"⚠ " + r->error;
     }
     std::wstring phase;
@@ -534,6 +567,10 @@ void MainWindow::ContextMenu(POINT pt) {
     AppendMenuW(m, MF_STRING, IDM_COPY_PATH, L"复制完整路径(&C)\tCtrl+Shift+C");
     AppendMenuW(m, MF_STRING, IDM_COPY_NAME, L"复制名称(&N)");
     if (GetSettings().allowRename) AppendMenuW(m, MF_STRING, IDM_RENAME, sel.size() > 1 ? L"重命名多个(&M)…\tF2" : L"重命名(&M)\tF2");
+    AppendMenuW(m, MF_STRING, IDM_CUT, L"剪切(&T)\tCtrl+X");
+    AppendMenuW(m, MF_STRING, IDM_COPY_FILES, L"复制(&Y)\tCtrl+C");
+    AppendMenuW(m, MF_STRING, IDM_COPY_TO, L"复制到文件夹(&F)…");
+    AppendMenuW(m, MF_STRING, IDM_MOVE_TO, L"移动到文件夹(&M)…");
     if (!cm) AppendMenuW(m, MF_STRING, IDM_DELETE, L"删除(&D)\tDel");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     if (cm) {
@@ -593,7 +630,7 @@ void MainWindow::SavePlacement() {
     s.h = MulDiv(wp.rcNormalPosition.bottom - wp.rcNormalPosition.top, 96, static_cast<int>(dpi));
     s.maximized = wp.showCmd == SW_SHOWMAXIMIZED;
     auto w = list_.ColumnWidths();
-    s.colName = w[0]; s.colPath = w[1]; s.colSize = w[2]; s.colDate = w[3];
+    if (w.size() >= 5) { s.colName = w[0]; s.colPath = w[1]; s.colExt = w[2]; s.colSize = w[3]; s.colDate = w[4]; }
 }
 
 // ---------- 文件操作 ----------
@@ -695,6 +732,78 @@ void MainWindow::Delete(bool permanent) {
         MessageBoxW(hwnd_, (L"删除失败：\n" + err).c_str(), kAppName, MB_ICONWARNING);
 }
 
+
+void MainWindow::ClipboardFiles(bool cut) {
+    auto paths = SelectedPaths();
+    std::wstring err;
+    if (!ClipboardSetFiles(hwnd_, paths, cut, err) && !err.empty())
+        MessageBoxW(hwnd_, err.c_str(), kAppName, MB_ICONWARNING);
+}
+
+void MainWindow::PasteFiles() {
+    // 粘贴到第一个选中项的父目录，否则到第一个结果的父目录
+    std::wstring dest;
+    auto paths = SelectedPaths();
+    if (!paths.empty()) {
+        auto slash = paths[0].find_last_of(L'\\');
+        dest = slash == std::wstring::npos ? paths[0] : paths[0].substr(0, slash);
+    } else if (auto r = list_.Results(); r && r->data && !r->items.empty()) {
+        dest = r->data->ParentPath(r->items[0]);
+    }
+    if (dest.empty()) { MessageBoxW(hwnd_, L"请先选中一个目标文件夹（或结果中的文件）。", kAppName, MB_ICONINFORMATION); return; }
+    std::wstring err;
+    if (!ClipboardPaste(hwnd_, dest, err) && !err.empty() && err != L"操作被取消")
+        MessageBoxW(hwnd_, (L"粘贴失败：\n" + err).c_str(), kAppName, MB_ICONWARNING);
+}
+
+void MainWindow::CopyOrMoveTo(bool move) {
+    auto paths = SelectedPaths();
+    std::wstring err;
+    if (!CopyOrMoveToFolder(hwnd_, paths, move, err) && !err.empty() && err != L"操作被取消")
+        MessageBoxW(hwnd_, err.c_str(), kAppName, MB_ICONWARNING);
+}
+
+void MainWindow::InstallUrlProtocol(bool install) {
+    std::wstring err;
+    if (!::ff::InstallUrlProtocol(install, &err))
+        MessageBoxW(hwnd_, err.empty() ? L"操作失败" : err.c_str(), kAppName, MB_ICONWARNING);
+    else
+        MessageBoxW(hwnd_, install ? L"已安装 es: 协议（当前用户）。" : L"已卸载 es: 协议。", kAppName, MB_ICONINFORMATION);
+}
+
+void MainWindow::InstallFolderContextMenu(bool install) {
+    std::wstring err;
+    if (!::ff::InstallFolderContextMenu(install, &err))
+        MessageBoxW(hwnd_, err.empty() ? L"操作失败" : err.c_str(), kAppName, MB_ICONWARNING);
+    else
+        MessageBoxW(hwnd_, install ? L"已安装文件夹右键「用闪寻搜索」。" : L"已卸载文件夹右键菜单。", kAppName, MB_ICONINFORMATION);
+}
+
+void MainWindow::HistoryUpDown(int delta) {
+    if (!GetSettings().historyEnabled) return;
+    if (historyPos_ < 0) {
+        historyCache_ = LoadSearchHistory();
+        int len = GetWindowTextLengthW(edit_);
+        historyDraft_.assign(static_cast<size_t>(len), L'\0');
+        if (len) GetWindowTextW(edit_, historyDraft_.data(), len + 1);
+        if (historyCache_.empty()) return;
+        historyPos_ = (delta < 0) ? 0 : -1;
+    }
+    int n = static_cast<int>(historyCache_.size());
+    int np = historyPos_ + delta;
+    if (np < -1) np = -1;
+    if (np >= n) np = n - 1;
+    historyPos_ = np;
+    const std::wstring& t = (historyPos_ < 0) ? historyDraft_ : historyCache_[static_cast<size_t>(historyPos_)];
+    SetWindowTextW(edit_, t.c_str());
+    SendMessageW(edit_, EM_SETSEL, t.size(), t.size());
+    RunSearch();
+}
+
+void MainWindow::ApplyStartup(const std::wstring& search, int filter, SortSpec sort, const std::wstring& select, bool reindex) {
+    startupSearch_ = search; startupFilter_ = filter; startupSort_ = sort; startupSelect_ = select; startupReindex_ = reindex;
+}
+
 // ---------- 深色菜单栏 ----------
 // Windows 没有公开的深色菜单栏：拦截未公开的 UAH 消息自绘菜单栏（WM_UAHDRAWMENU / WM_UAHDRAWMENUITEM），
 // 并在 WM_NCPAINT / WM_NCACTIVATE 之后补画菜单栏下方那条 1px 浅色线。弹出菜单用 uxtheme 序号 135/136（SetPreferredAppMode / FlushMenuThemes）。
@@ -772,9 +881,22 @@ bool MainWindow::PreTranslate(MSG& msg) {
     if (ctrl && k == 'P') { PostMessageW(hwnd_, WM_COMMAND, IDM_OPTIONS, 0); return true; }
     if (ctrl && k == 'W') { HideToTray(); return true; }
     if (ctrl && !shift && k == 'R') { PostMessageW(hwnd_, WM_COMMAND, IDM_REGEX, 0); return true; }
+    if (ctrl && !shift && k == 'I') { PostMessageW(hwnd_, WM_COMMAND, IDM_CASE, 0); return true; }
+    if (ctrl && !shift && k == 'B') { PostMessageW(hwnd_, WM_COMMAND, IDM_WHOLEWORD, 0); return true; }
+    if (ctrl && !shift && k == 'U') { PostMessageW(hwnd_, WM_COMMAND, IDM_MATCHPATH, 0); return true; }
+    if (ctrl && !shift && k == 'X' && msg.hwnd == list_.Hwnd()) { PostMessageW(hwnd_, WM_COMMAND, IDM_CUT, 0); return true; }
+    if (ctrl && !shift && k == 'C' && msg.hwnd == list_.Hwnd()) { PostMessageW(hwnd_, WM_COMMAND, IDM_COPY_FILES, 0); return true; }
+    if (ctrl && !shift && k == 'V') { PostMessageW(hwnd_, WM_COMMAND, IDM_PASTE, 0); return true; }
 
     if (msg.hwnd == edit_) {
         if (ctrl && k == 'A') { SendMessageW(edit_, EM_SETSEL, 0, -1); return true; }
+        if (k == VK_UP) { HistoryUpDown(-1); return true; }
+        if (k == VK_DOWN && GetKeyState(VK_MENU) >= 0) {
+            // Alt+Down 也可翻历史；普通 Down 仍进列表（无历史浏览时）
+            int len = GetWindowTextLengthW(edit_);
+            DWORD start = 0, end = 0; SendMessageW(edit_, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
+            if (historyPos_ >= 0 || (len == 0)) { HistoryUpDown(+1); return true; }
+        }
         if (k == VK_DOWN || k == VK_NEXT) {
             if (ListView_GetItemCount(lv) > 0) {
                 SetFocus(lv);
@@ -784,7 +906,12 @@ bool MainWindow::PreTranslate(MSG& msg) {
             }
             return true;
         }
-        if (k == VK_RETURN) { OpenItems(ctrl); return true; }
+        if (k == VK_RETURN) {
+            int len = GetWindowTextLengthW(edit_);
+            std::wstring q(static_cast<size_t>(len), L'\0'); if (len) GetWindowTextW(edit_, q.data(), len + 1);
+            AddSearchHistory(q); historyPos_ = -1;
+            OpenItems(ctrl); return true;
+        }
     } else if (msg.hwnd == lv) {
         if (k == VK_RETURN && alt) { ShowProperties(); return true; }
         if (k == VK_RETURN) { OpenItems(ctrl); return true; }
@@ -882,11 +1009,25 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         case IDM_RENAME_COMMIT: EndInlineRename(true); break;
         case IDM_DELETE: Delete(false); break;
         case IDM_DELETE_PERM: Delete(true); break;
-        case IDM_COL_PATH: case IDM_COL_SIZE: case IDM_COL_DATE: {
-            int c = id - IDM_COL_PATH + 1; list_.SetColumnVisible(c, !list_.ColumnVisible(c)); ApplyTheme(); break;
+        case IDM_COL_PATH: case IDM_COL_EXT: case IDM_COL_SIZE: case IDM_COL_DATE: {
+            int c = (id == IDM_COL_PATH) ? ColPath : (id == IDM_COL_EXT) ? ColExt : (id == IDM_COL_SIZE) ? ColSize : ColDate;
+            list_.SetColumnVisible(c, !list_.ColumnVisible(c)); ApplyTheme(); break;
         }
-        case IDM_REGEX:
-            GetSettings().matchRegex = !GetSettings().matchRegex; ApplyTheme(); RunSearch(); break;
+        case IDM_CASE: GetSettings().matchCase = !GetSettings().matchCase; ApplyTheme(); RunSearch(); break;
+        case IDM_WHOLEWORD: GetSettings().matchWholeWord = !GetSettings().matchWholeWord; ApplyTheme(); RunSearch(); break;
+        case IDM_MATCHPATH: GetSettings().matchPath = !GetSettings().matchPath; ApplyTheme(); RunSearch(); break;
+        case IDM_REGEX: GetSettings().matchRegex = !GetSettings().matchRegex; ApplyTheme(); RunSearch(); break;
+        case IDM_HISTORY_ENABLE: GetSettings().historyEnabled = !GetSettings().historyEnabled; ApplyTheme(); break;
+        case IDM_CLEAR_HISTORY: ClearSearchHistory(); break;
+        case IDM_CUT: ClipboardFiles(true); break;
+        case IDM_COPY_FILES: ClipboardFiles(false); break;
+        case IDM_PASTE: PasteFiles(); break;
+        case IDM_COPY_TO: CopyOrMoveTo(false); break;
+        case IDM_MOVE_TO: CopyOrMoveTo(true); break;
+        case IDM_INSTALL_URL: InstallUrlProtocol(true); ApplyTheme(); break;
+        case IDM_UNINSTALL_URL: InstallUrlProtocol(false); ApplyTheme(); break;
+        case IDM_INSTALL_FOLDER_CM: InstallFolderContextMenu(true); ApplyTheme(); break;
+        case IDM_UNINSTALL_FOLDER_CM: InstallFolderContextMenu(false); ApplyTheme(); break;
         case IDM_DOUBLE_CTRL:
             GetSettings().doubleCtrl = !GetSettings().doubleCtrl;
             if (GetSettings().doubleCtrl) hotkeys_.EnableDoubleCtrl(hwnd_); else hotkeys_.DisableDoubleCtrl();
@@ -946,7 +1087,31 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_APP_INDEX_PROGRESS: UpdateStatus(); return 0;
-    case WM_APP_INDEX_DONE: RunSearch(); UpdateStatus(); return 0;
+    case WM_APP_INDEX_DONE:
+        if (!startupApplied_) {
+            startupApplied_ = true;
+            if (startupFilter_ >= 0 && filter_) SendMessageW(filter_, CB_SETCURSEL, startupFilter_, 0);
+            if (startupSort_.col != SortCol::Name || startupSort_.desc) list_.SetSort(startupSort_);
+            if (!startupSearch_.empty()) SetWindowTextW(edit_, startupSearch_.c_str());
+            if (startupReindex_) { StartIndex(true); return 0; }
+        }
+        RunSearch(); UpdateStatus();
+        if (!startupSelect_.empty()) {
+            // 选中匹配完整路径的第一项
+            auto r = list_.Results();
+            if (r && r->data) {
+                for (size_t row = 0; row < r->items.size(); ++row) {
+                    if (_wcsicmp(r->data->FullPath(r->items[row]).c_str(), startupSelect_.c_str()) == 0) {
+                        ListView_SetItemState(list_.Hwnd(), -1, 0, LVIS_SELECTED);
+                        ListView_SetItemState(list_.Hwnd(), static_cast<int>(row), LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                        ListView_EnsureVisible(list_.Hwnd(), static_cast<int>(row), FALSE);
+                        break;
+                    }
+                }
+            }
+            startupSelect_.clear();
+        }
+        return 0;
     case WM_CLOSE:
         if (GetSettings().closeToTray) { HideToTray(); return 0; }
         DestroyWindow(hwnd_);

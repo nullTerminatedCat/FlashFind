@@ -526,16 +526,23 @@ static int SortTest(std::wstring dbPath) {
     swprintf_s(buf, L"[db] %zu 个对象\r\n", d->entries.size()); out += buf;
     double t0 = NowMs(); auto rank = BuildFolderPathRank(*d); double rankMs = NowMs() - t0;
     swprintf_s(buf, L"[path-rank] 文件夹路径先序排名 %.1f ms\r\n", rankMs); out += buf;
-    const wchar_t* cn[] = {L"名称", L"路径", L"大小", L"时间"};
+    const wchar_t* cn[] = {L"名称", L"路径", L"扩展名", L"大小", L"时间"};
     for (const wchar_t* q : {L"", L"exe", L"*.dll"}) {
         std::vector<uint32_t> base; SearchCore(*d, ParseTerms(q), base, [] { return false; });
-        for (int c = 0; c < 4; ++c) for (int desc = 0; desc < 2; ++desc) {
+        for (int c = 0; c < 5; ++c) for (int desc = 0; desc < 2; ++desc) {
             SortSpec so{static_cast<SortCol>(c), desc != 0};
             std::vector<uint32_t> it; double best = 1e9;
             for (int k = 0; k < 3; ++k) { it = base; double a = NowMs(); SortItems(*d, it, so, &rank); best = std::min(best, NowMs() - a); }
             bool ok = it.size() == base.size();
             auto key = [&](uint32_t i) -> uint64_t { const Entry& e = d->entries[i];
-                return c == 2 ? (e.IsDir() ? 0 : e.size + 1) : c == 3 ? e.mtime : (e.parent == kNoParent ? 0 : rank[e.parent]); };
+                if (c == 3) return e.IsDir() ? 0 : e.size + 1;
+                if (c == 4) return e.mtime;
+                if (c == 2) { // Ext — 与 SortItems 相同的简易键
+                    auto nm = d->Name(i); size_t dot = e.IsDir() ? std::wstring_view::npos : nm.rfind(L'.');
+                    uint64_t h = 0; if (dot != std::wstring_view::npos) for (size_t k = dot + 1; k < nm.size() && k < dot + 9; ++k) h = (h << 8) | (Fold(nm[k]) & 0xFF);
+                    return h;
+                }
+                return e.parent == kNoParent ? 0 : rank[e.parent]; };
             for (size_t k = 1; k < it.size() && ok && c > 0; ++k) { uint64_t a = key(it[k - 1]), b = key(it[k]); if (desc ? a < b : a > b) ok = false; }
             if (c == 0) ok = ok && (desc ? std::equal(it.begin(), it.end(), base.rbegin()) : it == base);
             swprintf_s(buf, L"  %s %-6s %s %s results=%-8zu sort=%7.2f ms\r\n", ok ? L"[OK]  " : L"[FAIL]", q[0] ? q : L"(全部)", cn[c], desc ? L"降" : L"升", it.size(), best); out += buf;
@@ -608,6 +615,15 @@ static int SyntaxTest(std::wstring dbPath) {
     T(L"\"report.d\"", L"report.docx");
     T(L"*.exe | *.pdf !1*", L"notepad.exe,report.pdf");
     T(L"size:abc", L"");
+    T(L"startwith:notes", L"notes.txt");
+    T(L"startwith:note", L"notepad.exe,notes.txt");
+    T(L"endwith:.exe", L"1setup.exe,notepad.exe");
+    T(L"exact:report", L"report");
+    T(L"parent:Docs", L"notes.txt,photo.JPG,report.docx,report.pdf");
+    T(L"nopath:windows", L"Windows");  // 仅名称：Windows 文件夹
+    T(L"depth:1", L"Docs,T:,Windows");  // 根若为 T:\\ 则深度 1
+    T(L"parent:Windows exact:report", L"report");
+
     InitFold(); g_fastAscii = true;
     std::wstring err; if (dbPath.empty()) dbPath = Indexer::DefaultDbPath();
     auto big = LoadDbCopy(dbPath, err);
@@ -637,7 +653,8 @@ static int RegexTest(std::wstring dbPath) {
     std::vector<VolumeData> vols; vols.push_back(std::move(v));
     auto d = Merge(vols, 0);
     auto names = [&](const wchar_t* q, bool rx, const wchar_t* extra, std::wstring* err) {
-        auto cq = CompileQuery(q, rx, extra); std::vector<uint32_t> r; SearchQuery(*d, *cq, r, [] { return false; });
+        MatchOpts o; o.matchRegex = rx;
+        auto cq = CompileQuery(q, o, extra); std::vector<uint32_t> r; SearchQuery(*d, *cq, r, [] { return false; });
         if (err) *err = QueryError(*cq);
         std::vector<std::wstring> n; for (uint32_t i : r) n.emplace_back(d->Name(i)); std::sort(n.begin(), n.end());
         std::wstring s; for (auto& x : n) { if (!s.empty()) s += L","; s += x; } return s;
@@ -673,7 +690,7 @@ static int RegexTest(std::wstring dbPath) {
         {L"\\.exe$", true}, {L"^report", true}, {L"^[a-z]+\\d{3,}\\.(jpg|png)$", true}, {L"(?i)setup.*\\.msi$", true}, {L"^.*$", true},
         {L"\\d{4}-\\d{2}-\\d{2}", true}, {L"windows\\\\system32\\\\.*\\.dll$", true}, {L"ext:exe", false}, {L"*.exe", false}};
     for (auto& x : qs) {
-        double c0 = NowMs(); auto cq = CompileQuery(x.q, x.rx); double cms = NowMs() - c0;
+        MatchOpts o; o.matchRegex = x.rx; double c0 = NowMs(); auto cq = CompileQuery(x.q, o); double cms = NowMs() - c0;
         std::vector<uint32_t> res; double best = 1e9;
         for (int k = 0; k < 5; ++k) { double a = NowMs(); SearchQuery(*big, *cq, res, [] { return false; }); best = std::min(best, NowMs() - a); }
         swprintf_s(buf, L"[search] %s%-36s results=%-8zu compile=%5.2f ms best=%7.2f ms\r\n", x.rx ? L"regex " : L"      ", x.q, res.size(), cms, best); out += buf;
@@ -784,7 +801,7 @@ static int SortClickTest() {
         SendInput(2, in, sizeof(INPUT));
         pump(500);
     };
-    const wchar_t* cn[] = {L"名称", L"路径", L"大小", L"时间"};
+    const wchar_t* cn[] = {L"名称", L"路径", L"扩展名", L"大小", L"时间"};
     auto key = [&](int c, uint32_t i) -> uint64_t { const Entry& e = d->entries[i];
         return c == 2 ? (e.IsDir() ? 0 : e.size + 1) : c == 3 ? e.mtime : (e.parent == kNoParent ? 0 : rank[e.parent]); };
     // 名称当前升序：点 路径(升) 路径(降) 大小(降) 大小(升) 时间(降) 时间(升) 名称(升) 名称(降)
@@ -988,7 +1005,71 @@ int App::Run(HINSTANCE inst, int show) {
         }
     }
     if (wcsstr(GetCommandLineW(), L"-selftest")) return SelfTest();
-    // 单实例：已有实例则让它显示后退出
+
+    std::wstring cliSearch, cliSelect;
+    int cliFilter = -1; SortSpec cliSort{}; bool cliReindex = false, startHidden = false;
+    {
+        int argc = 0; LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        auto eq = [](const wchar_t* a, const wchar_t* b) { return _wcsicmp(a, b) == 0; };
+        auto need = [&](int& i) -> const wchar_t* { return (i + 1 < argc) ? argv[++i] : L""; };
+        for (int i = 1; i < argc; ++i) {
+            const wchar_t* a = argv[i];
+            if (eq(a, L"-help") || eq(a, L"-h") || eq(a, L"-?")) {
+                MessageBoxW(nullptr,
+                    L"闪寻 FlashFind\n\n"
+                    L"FlashFind.exe [选项]\n\n"
+                    L"-s, -search <文本>     设置搜索\n"
+                    L"-p, -path <路径>       搜索路径（path:前缀）\n"
+                    L"-filter <序号|名称>    过滤器\n"
+                    L"-sort <name|path|ext|size|date>\n"
+                    L"-sort-ascending / -sort-descending\n"
+                    L"-select <完整路径>     选中结果\n"
+                    L"-reindex               强制重建索引\n"
+                    L"-url <es:搜索>         从 es: URL 设置搜索\n"
+                    L"-startup               后台启动（隐藏）\n"
+                    L"-exit, -quit            退出已运行的实例\n"
+                    L"-help                  显示本说明\n",
+                    L"闪寻 — 命令行", MB_OK | MB_ICONINFORMATION);
+                LocalFree(argv); return 0;
+            }
+            if (eq(a, L"-exit") || eq(a, L"-quit")) {
+                LocalFree(argv);
+                if (HWND h = FindWindowW(kMainClass, nullptr)) PostMessageW(h, WM_CLOSE, 0, 0);
+                return 0;
+            }
+            if (eq(a, L"-startup")) startHidden = true;
+            else if (eq(a, L"-reindex")) cliReindex = true;
+            else if (eq(a, L"-s") || eq(a, L"-search")) cliSearch = need(i);
+            else if (eq(a, L"-p") || eq(a, L"-path")) {
+                std::wstring path = need(i);
+                if (!path.empty()) cliSearch = L"path:" + path;
+            } else if (eq(a, L"-filter")) {
+                std::wstring f = need(i);
+                if (!f.empty() && f[0] >= L'0' && f[0] <= L'9') cliFilter = _wtoi(f.c_str());
+                else {
+                    const wchar_t* names[] = {L"全部", L"音频", L"压缩文件", L"文档", L"可执行文件", L"文件夹", L"图片", L"视频"};
+                    for (int k = 0; k < 8; ++k) if (_wcsicmp(f.c_str(), names[k]) == 0) { cliFilter = k; break; }
+                }
+            } else if (eq(a, L"-sort")) {
+                std::wstring c = need(i);
+                if (eq(c.c_str(), L"name")) cliSort.col = SortCol::Name;
+                else if (eq(c.c_str(), L"path")) cliSort.col = SortCol::Path;
+                else if (eq(c.c_str(), L"ext") || eq(c.c_str(), L"extension")) cliSort.col = SortCol::Ext;
+                else if (eq(c.c_str(), L"size")) cliSort.col = SortCol::Size;
+                else if (eq(c.c_str(), L"date") || eq(c.c_str(), L"date_modified")) cliSort.col = SortCol::Date;
+            } else if (eq(a, L"-sort-ascending")) cliSort.desc = false;
+            else if (eq(a, L"-sort-descending")) cliSort.desc = true;
+            else if (eq(a, L"-select")) cliSelect = need(i);
+            else if (eq(a, L"-url")) {
+                const wchar_t* q = need(i);
+                if (_wcsnicmp(q, L"es:", 3) == 0) q += 3;
+                if (q[0] == L'/' && q[1] == L'/') q += 2;
+                cliSearch = q;
+            }
+        }
+        LocalFree(argv);
+    }
+
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\FlashFind.Instance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         if (HWND h = FindWindowW(kMainClass, nullptr)) {
@@ -999,7 +1080,7 @@ int App::Run(HINSTANCE inst, int show) {
         return 0;
     }
 
-    OleInitialize(nullptr);   // STA + OLE 拖放（拖出到资源管理器）
+    OleInitialize(nullptr);
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
 
@@ -1007,8 +1088,8 @@ int App::Run(HINSTANCE inst, int show) {
     GetSettings().Load();
     GetTheme().Resolve(GetSettings().theme);
 
-    bool startHidden = wcsstr(GetCommandLineW(), L"-startup") != nullptr;
     MainWindow wnd;
+    wnd.ApplyStartup(cliSearch, cliFilter, cliSort, cliSelect, cliReindex);
     if (!wnd.Create(startHidden ? SW_HIDE : show)) return 1;
 
     MSG msg;

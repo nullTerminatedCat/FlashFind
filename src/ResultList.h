@@ -11,7 +11,7 @@
 
 namespace ff {
 
-enum Column { ColName = 0, ColPath, ColSize, ColDate, ColCount };
+enum Column { ColName = 0, ColPath, ColExt, ColSize, ColDate, ColCount };
 
 class ResultList {
 public:

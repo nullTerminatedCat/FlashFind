@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(FlashFind VERSION 0.2.1 LANGUAGES C CXX RC)
+project(FlashFind VERSION 0.3.0 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -46,6 +46,8 @@ add_executable(FlashFind WIN32
     src/Util.h
     src/Options.cpp src/Options.h
     src/FileOps.cpp src/FileOps.h
+    src/History.cpp src/History.h
+    src/ShellInstall.cpp src/ShellInstall.h
     src/NtfsSource.cpp src/NtfsSource.h src/Service.cpp
     src/MftIndexer.cpp
     src/Usn.cpp src/Usn.h

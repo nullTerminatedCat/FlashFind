@@ -13,12 +13,19 @@ struct Settings {
     bool maximized = false;
     int colName = 260, colPath = 380, colSize = 90, colDate = 140;
     int sortCol = 0; bool sortDesc = false;
-    bool colVisible[4] = {true, true, true, true};   // [columns] path_visible / size_visible / date_modified_visible（名称列总是显示）
+    bool colVisible[5] = {true, true, true, true, true};   // 名称/路径/扩展名/大小/修改时间
     // 行为：文件操作
     bool allowRename = true;                 // [general] allow_rename：F2 重命名
     bool singleParentContextMenu = true;     // [general] single_parent_context_menu：选择在同一文件夹时使用系统右键菜单
-    bool matchRegex = false;   // [search] match_regex
-    int filter = 0;   // [search] filter：过滤器序号   // [columns] sort / sort_ascending
+    bool matchRegex = false;       // [search] match_regex
+    bool matchCase = false;        // [search] match_case
+    bool matchWholeWord = false;   // [search] match_whole_word
+    bool matchPath = false;        // [search] match_path（所有词匹配完整路径）
+    bool historyEnabled = true;    // [history] enabled
+    int historyMax = 100;          // [history] max_entries（64–128 常用）
+    int colExt = 70;               // [columns] extension
+    // colVisible[0]=名称(恒真) [1]路径 [2]扩展名 [3]大小 [4]修改时间
+    int filter = 0;   // [search] filter
     // 行为
     bool escHides = true;
     bool closeToTray = true;

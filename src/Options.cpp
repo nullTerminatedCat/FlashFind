@@ -4,6 +4,7 @@
 #include "Hotkey.h"
 #include "Settings.h"
 #include "Theme.h"
+#include "ShellInstall.h"
 #include <commctrl.h>
 #include <windowsx.h>
 #include <shobjidl.h>
@@ -42,6 +43,7 @@ enum : int {
     IDC_VOLS, IDC_V_INCLUDE, IDC_V_MONITOR, IDC_V_USN, IDC_V_ONLY,
     // 排除
     IDC_EX_LIST, IDC_EX_EDIT, IDC_EX_ADD, IDC_EX_BROWSE, IDC_EX_REMOVE,
+    IDC_URL_PROTO, IDC_FOLDER_CM,
 };
 
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -108,12 +110,14 @@ void Dlg::Build() {
     chk(0, L"ASCII 快速搜索（fast_ascii_search）", T + 90, IDC_FAST_ASCII, work_.fastAsciiSearch);
     chk(0, L"开机时自动启动闪寻（当前用户）", T + 120, IDC_AUTOSTART, AutostartEnabled());
     chk(0, L"压缩数据库（更小，加载稍慢）", T + 150, IDC_COMPRESS, work_.compressDb);
-    Ctl(0, WC_STATICW, L"主题：", 0, L, T + 192, 120, 22, -1);
-    HWND th = Ctl(0, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, L + 130, T + 188, 160, 200, IDC_THEME);
+    Ctl(0, WC_BUTTONW, L"安装 es: 协议与文件夹「用闪寻搜索」", BS_PUSHBUTTON | WS_TABSTOP, L, T + 180, 300, 26, IDC_URL_PROTO);
+    Ctl(0, WC_BUTTONW, L"卸载 es: 协议与文件夹菜单", BS_PUSHBUTTON | WS_TABSTOP, L + 310, T + 180, 160, 26, IDC_FOLDER_CM);
+    Ctl(0, WC_STATICW, L"主题：", 0, L, T + 220, 120, 22, -1);
+    HWND th = Ctl(0, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, L + 130, T + 216, 160, 200, IDC_THEME);
     for (auto t : {L"跟随系统", L"浅色", L"深色"}) SendMessageW(th, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(t));
     SendMessageW(th, CB_SETCURSEL, static_cast<int>(work_.theme), 0);
-    Ctl(0, WC_STATICW, L"USN 更新间隔（毫秒）：", 0, L, T + 230, 160, 22, -1);
-    HWND de = Ctl(0, WC_EDITW, std::to_wstring(work_.monitorUpdateDelay).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, L + 170, T + 226, 90, 24, IDC_DELAY);
+    Ctl(0, WC_STATICW, L"USN 更新间隔（毫秒）：", 0, L, T + 258, 160, 22, -1);
+    HWND de = Ctl(0, WC_EDITW, std::to_wstring(work_.monitorUpdateDelay).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, L + 170, T + 254, 90, 24, IDC_DELAY);
     (void)de;
     // 键盘
     Ctl(1, WC_STATICW, L"显示/隐藏窗口的全局热键（在框内按下组合键）：", 0, L, T, 460, 22, -1);
@@ -252,6 +256,20 @@ LRESULT Dlg::Handle(UINT m, WPARAM w, LPARAM l) {
         case IDC_OK: case IDOK: Apply(); done_ = true; return 0;
         case IDC_CANCEL: case IDCANCEL: done_ = true; return 0;
         case IDC_APPLY: Apply(); return 0;
+        case IDC_URL_PROTO: {
+            std::wstring err;
+            if (::ff::InstallUrlProtocol(true, &err) && ::ff::InstallFolderContextMenu(true, &err))
+                MessageBoxW(hwnd_, L"已安装 es: 协议与文件夹右键「用闪寻搜索」。", L"闪寻", MB_OK | MB_ICONINFORMATION);
+            else MessageBoxW(hwnd_, err.empty() ? L"安装失败" : err.c_str(), L"闪寻", MB_OK | MB_ICONWARNING);
+            return 0;
+        }
+        case IDC_FOLDER_CM: {
+            std::wstring err;
+            if (::ff::InstallUrlProtocol(false, &err) && ::ff::InstallFolderContextMenu(false, &err))
+                MessageBoxW(hwnd_, L"已卸载 es: 协议与文件夹菜单。", L"闪寻", MB_OK | MB_ICONINFORMATION);
+            else MessageBoxW(hwnd_, err.empty() ? L"卸载失败" : err.c_str(), L"闪寻", MB_OK | MB_ICONWARNING);
+            return 0;
+        }
         case IDC_HOTKEY: if (code == EN_CHANGE) HotkeyStatus(); return 0;
         case IDC_VOLS:
             if (code == LBN_SELCHANGE) { StoreVol(); curVol_ = static_cast<int>(SendDlgItemMessageW(hwnd_, IDC_VOLS, LB_GETCURSEL, 0, 0)); LoadVol(); }

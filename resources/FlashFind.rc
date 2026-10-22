@@ -3,8 +3,8 @@
 1 RT_MANIFEST "app.manifest"
 101 ICON "FlashFind.ico"
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,2,1,0
- PRODUCTVERSION 0,2,1,0
+ FILEVERSION 0,3,0,0
+ PRODUCTVERSION 0,3,0,0
  FILEOS VOS_NT_WINDOWS32
  FILETYPE VFT_APP
 BEGIN
@@ -14,9 +14,9 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "FlashFind"
       VALUE "FileDescription", "FlashFind 闪寻 - 文件名极速搜索"
-      VALUE "FileVersion", "0.2.1"
+      VALUE "FileVersion", "0.3.0"
       VALUE "ProductName", "FlashFind"
-      VALUE "ProductVersion", "0.2.1"
+      VALUE "ProductVersion", "0.3.0"
       VALUE "OriginalFilename", "FlashFind.exe"
     END
   END

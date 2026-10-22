@@ -1,7 +1,7 @@
 ﻿; 闪寻安装脚本：由 scripts/package.ps1 调用 ISCC 编译
 #define AppName "闪寻 FlashFind"
 #ifndef AppVersion
-  #define AppVersion "0.2.1"
+  #define AppVersion "0.3.0"
 #endif
 #define AppExe "FlashFind.exe"
 #ifndef AppArchitecture

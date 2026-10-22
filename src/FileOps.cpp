@@ -259,4 +259,100 @@ bool ShowRenameDialog(HWND owner, const std::vector<std::wstring>& paths, std::v
     RenameDlg d; return d.Run(owner, paths, names);
 }
 
+
+bool ClipboardSetFiles(HWND owner, const std::vector<std::wstring>& paths, bool cut, std::wstring& err) {
+    if (paths.empty()) { err = L"未选择文件"; return false; }
+    // DROPFILES + 双 null 结尾的路径表
+    size_t chars = 1;
+    for (auto& p : paths) chars += p.size() + 1;
+    size_t bytes = sizeof(DROPFILES) + chars * sizeof(wchar_t);
+    HGLOBAL hDrop = GlobalAlloc(GHND, bytes);
+    if (!hDrop) { err = L"内存不足"; return false; }
+    auto* df = static_cast<DROPFILES*>(GlobalLock(hDrop));
+    df->pFiles = sizeof(DROPFILES); df->fWide = TRUE;
+    wchar_t* dest = reinterpret_cast<wchar_t*>(reinterpret_cast<BYTE*>(df) + sizeof(DROPFILES));
+    for (auto& p : paths) { wcscpy_s(dest, p.size() + 1, p.c_str()); dest += p.size() + 1; }
+    *dest = 0;
+    GlobalUnlock(hDrop);
+
+    HGLOBAL hEff = GlobalAlloc(GHND, sizeof(DWORD));
+    if (hEff) { *static_cast<DWORD*>(GlobalLock(hEff)) = cut ? DROPEFFECT_MOVE : DROPEFFECT_COPY; GlobalUnlock(hEff); }
+
+    if (!OpenClipboard(owner)) { GlobalFree(hDrop); if (hEff) GlobalFree(hEff); err = L"无法打开剪贴板"; return false; }
+    EmptyClipboard();
+    SetClipboardData(CF_HDROP, hDrop);
+    UINT fmt = RegisterClipboardFormatW(L"Preferred DropEffect");
+    if (hEff && fmt) SetClipboardData(fmt, hEff);
+    CloseClipboard();
+    return true;
+}
+
+bool ClipboardPaste(HWND owner, const std::wstring& destDir, std::wstring& err) {
+    if (!IsClipboardFormatAvailable(CF_HDROP) || !OpenClipboard(owner)) { err = L"剪贴板没有文件"; return false; }
+    HDROP drop = static_cast<HDROP>(GetClipboardData(CF_HDROP));
+    bool move = false;
+    UINT fmt = RegisterClipboardFormatW(L"Preferred DropEffect");
+    if (fmt) {
+        HANDLE h = GetClipboardData(fmt);
+        if (h) { DWORD* p = static_cast<DWORD*>(GlobalLock(h)); if (p) { move = (*p & DROPEFFECT_MOVE) != 0; GlobalUnlock(h); } }
+    }
+    std::vector<std::wstring> paths;
+    if (drop) {
+        UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        for (UINT i = 0; i < n; ++i) {
+            UINT len = DragQueryFileW(drop, i, nullptr, 0);
+            std::wstring p(len, L'\0'); DragQueryFileW(drop, i, p.data(), len + 1); paths.push_back(p);
+        }
+    }
+    CloseClipboard();
+    if (paths.empty()) { err = L"剪贴板没有文件"; return false; }
+
+    Com<IFileOperation> op;
+    HRESULT hr = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&op));
+    if (FAILED(hr)) { err = HrText(hr); return false; }
+    Com<IShellItem> dest;
+    hr = SHCreateItemFromParsingName(destDir.c_str(), nullptr, IID_PPV_ARGS(&dest));
+    if (FAILED(hr)) { err = HrText(hr); return false; }
+    Com<IShellItemArray> arr;
+    hr = MakeItemArray(paths, &arr);
+    if (FAILED(hr)) { err = HrText(hr); return false; }
+    op->SetOwnerWindow(owner);
+    op->SetOperationFlags(FOF_ALLOWUNDO | FOFX_SHOWELEVATIONPROMPT);
+    hr = move ? op->MoveItems(arr.p, dest.p) : op->CopyItems(arr.p, dest.p);
+    if (SUCCEEDED(hr)) hr = op->PerformOperations();
+    BOOL aborted = FALSE; op->GetAnyOperationsAborted(&aborted);
+    if (FAILED(hr)) { err = HrText(hr); return false; }
+    if (aborted) { err = L"操作被取消"; return false; }
+    if (move) { OpenClipboard(owner); EmptyClipboard(); CloseClipboard(); }
+    return true;
+}
+
+bool CopyOrMoveToFolder(HWND owner, const std::vector<std::wstring>& paths, bool move, std::wstring& err) {
+    if (paths.empty()) { err = L"未选择文件"; return false; }
+    Com<IFileOpenDialog> dlg;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&dlg));
+    if (FAILED(hr)) { err = HrText(hr); return false; }
+    DWORD opt = 0; dlg->GetOptions(&opt);
+    dlg->SetOptions(opt | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    dlg->SetTitle(move ? L"移动到文件夹" : L"复制到文件夹");
+    hr = dlg->Show(owner);
+    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) { err = L"操作被取消"; return false; }
+    if (FAILED(hr)) { err = HrText(hr); return false; }
+    Com<IShellItem> folder; hr = dlg->GetResult(&folder);
+    if (FAILED(hr)) { err = HrText(hr); return false; }
+    Com<IFileOperation> op;
+    hr = CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&op));
+    if (FAILED(hr)) { err = HrText(hr); return false; }
+    Com<IShellItemArray> arr; hr = MakeItemArray(paths, &arr);
+    if (FAILED(hr)) { err = HrText(hr); return false; }
+    op->SetOwnerWindow(owner);
+    op->SetOperationFlags(FOF_ALLOWUNDO | FOFX_SHOWELEVATIONPROMPT);
+    hr = move ? op->MoveItems(arr.p, folder.p) : op->CopyItems(arr.p, folder.p);
+    if (SUCCEEDED(hr)) hr = op->PerformOperations();
+    BOOL aborted = FALSE; op->GetAnyOperationsAborted(&aborted);
+    if (FAILED(hr)) { err = HrText(hr); return false; }
+    if (aborted) { err = L"操作被取消"; return false; }
+    return true;
+}
+
 } // namespace ff

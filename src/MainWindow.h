@@ -15,6 +15,8 @@ public:
     bool Create(int show);
     bool PreTranslate(MSG& msg);   // 键盘快捷键
     HWND Hwnd() const { return hwnd_; }
+    // 启动参数（命令行）
+    void ApplyStartup(const std::wstring& search, int filter, SortSpec sort, const std::wstring& select, bool reindex);
 
 private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -41,18 +43,25 @@ private:
     void TrayMenu();
     void ServiceAction(bool install);
     void SavePlacement();
-    // 文件操作（FileOps）
     std::vector<std::wstring> SelectedPaths() const;
-    void Rename();                       // F2：单项就地编辑，多项对话框
+    void Rename();
     void BeginInlineRename();
     void EndInlineRename(bool commit);
     static LRESULT CALLBACK RenameEditProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
-    void Delete(bool permanent);         // Del 回收站；Shift+Del 永久删除（确认）
-    bool DarkMenuBar(UINT m, WPARAM w, LPARAM l, LRESULT* out);   // 深色菜单栏（UAH 自绘，未公开消息）
+    void Delete(bool permanent);
+    void ClipboardFiles(bool cut);
+    void PasteFiles();
+    void CopyOrMoveTo(bool move);
+    void InstallUrlProtocol(bool install);
+    void InstallFolderContextMenu(bool install);
+    void HistoryUpDown(int delta);   // 搜索框 ↑/↓ 浏览历史
+    bool DarkMenuBar(UINT m, WPARAM w, LPARAM l, LRESULT* out);
 
     HWND hwnd_ = nullptr, edit_ = nullptr, svcBtn_ = nullptr, filter_ = nullptr;
     HBITMAP shieldBmp_ = nullptr;
     HWND renameEdit_ = nullptr; std::wstring renamePath_, renameOrig_; bool renameEnding_ = false;
+    std::vector<std::wstring> historyCache_; int historyPos_ = -1; std::wstring historyDraft_;
+    std::wstring startupSearch_, startupSelect_; int startupFilter_ = -1; SortSpec startupSort_{}; bool startupReindex_ = false; bool startupApplied_ = false;
     IContextMenu2* cm2_ = nullptr;
     IContextMenu3* cm3_ = nullptr;
     int svcBtnW_ = 0;
