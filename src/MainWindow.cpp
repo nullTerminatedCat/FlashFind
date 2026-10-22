@@ -516,20 +516,20 @@ void MainWindow::CopyPaths(bool nameOnly) {
     CloseClipboard();
 }
 
-void MainWindow::ShowImagePreview() {
+bool MainWindow::ShowImagePreview() {
     auto paths = SelectedPaths();
-    if (paths.empty()) return;
+    if (paths.empty()) return false;
     std::wstring path = paths[0];
     int fi = list_.FocusedIndex();
     auto r = list_.Results();
-    if (fi >= 0 && r && static_cast<size_t>(fi) < r->items.size()) {
-        // 焦点行若在选中集合中则用它，否则仍用选中第一项
+    if (fi >= 0 && r && r->data && static_cast<size_t>(fi) < r->items.size()) {
+        // 焦点行若在选中集合中则预览焦点行，否则预览选中的第一项
         uint32_t idx = r->items[static_cast<size_t>(fi)];
         auto sel = list_.Selection();
         if (std::find(sel.begin(), sel.end(), idx) != sel.end())
             path = r->data->FullPath(idx);
     }
-    imagePreview_.Show(hwnd_, path);
+    return imagePreview_.Show(hwnd_, path);
 }
 
 void MainWindow::HideImagePreview() {
@@ -941,8 +941,11 @@ bool MainWindow::PreTranslate(MSG& msg) {
     } else if (msg.hwnd == lv) {
         if (k == VK_RETURN && alt) { ShowProperties(); return true; }
         if (k == VK_SPACE && !ctrl && !alt && !shift) {
-            if (!spacePreviewHeld_) { spacePreviewHeld_ = true; ShowImagePreview(); }
-            return true;
+            // 仅在列表焦点：按下显示、松开关闭；Show 失败不置 held，避免吞掉后续按键
+            if (!spacePreviewHeld_) {
+                if (ShowImagePreview()) spacePreviewHeld_ = true;
+            }
+            return true;  // 无论成败都吞掉空格，避免 ListView 切换选中
         }
         if (k == VK_RETURN) { OpenItems(ctrl); return true; }
         if (ctrl && shift && k == 'C') { CopyPaths(false); return true; }
@@ -1000,8 +1003,12 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
     }
     case WM_ACTIVATE:
         if (LOWORD(w) == WA_INACTIVE) {
-            if (spacePreviewHeld_) { spacePreviewHeld_ = false; HideImagePreview(); }
-        } else {
+            // lParam = 即将激活的窗口；若是我们的预览浮层则不要关掉
+            HWND other = reinterpret_cast<HWND>(l);
+            if (spacePreviewHeld_ && other != imagePreview_.Hwnd()) {
+                spacePreviewHeld_ = false; HideImagePreview();
+            }
+        } else if (!spacePreviewHeld_ && !imagePreview_.Visible()) {
             SetFocus(edit_);
         }
         return 0;

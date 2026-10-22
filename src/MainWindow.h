@@ -40,7 +40,7 @@ private:
     void OpenItems(bool openPath);
     void CopyPaths(bool nameOnly);
     void ShowProperties();
-    void ShowImagePreview();
+    bool ShowImagePreview();
     void HideImagePreview();
     void ContextMenu(POINT screenPt);
     void TrayMenu();

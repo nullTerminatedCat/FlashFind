@@ -205,7 +205,9 @@ bool ImagePreview::Show(HWND owner, const std::wstring& path) {
     }
 
     RECT orc{}; GetWindowRect(owner, &orc);
-    hwnd_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+    // WS_EX_NOACTIVATE + SW_SHOWNOACTIVATE：浮层不抢激活，否则主窗会收到
+    // WA_INACTIVE 并立刻 Hide，表现为「按空格没效果」。
+    hwnd_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
         L"FlashFindImagePreview", L"",
         WS_POPUP,
         orc.left, orc.top, orc.right - orc.left, orc.bottom - orc.top,
@@ -215,8 +217,10 @@ bool ImagePreview::Show(HWND owner, const std::wstring& path) {
     font_ = CreateFontW(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
     if (!font_) font_ = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    ShowWindow(hwnd_, SW_SHOW);
+    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(hwnd_, nullptr, FALSE);
+    UpdateWindow(hwnd_);
     return true;
 }
 

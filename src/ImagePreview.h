@@ -14,6 +14,7 @@ public:
     bool Show(HWND owner, const std::wstring& path);
     void Hide();
     bool Visible() const { return hwnd_ != nullptr && IsWindowVisible(hwnd_); }
+    HWND Hwnd() const { return hwnd_; }
 
 private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
