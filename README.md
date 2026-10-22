@@ -2,7 +2,7 @@
 
 Windows 上的极速文件名搜索工具，交互参考 voidtools Everything 1.4。原生 Win32 + C++20，只依赖 Windows SDK（不用 Qt / MFC / 第三方库），单个 `FlashFind.exe`。
 
-> 当前版本：**0.3.0（匹配开关、扩展语法、扩展名列、剪贴板、历史、命令行、es:）**。界面设计见 [docs/UI_DESIGN.md](docs/UI_DESIGN.md)，视觉稿见 `docs/ui_mockup_v2.html`；路线图见 [PRODUCT_PLAN.md](PRODUCT_PLAN.md)。
+> 当前版本：**0.3.1（选中高亮修复、按住空格预览图片/文本）**。界面设计见 [docs/UI_DESIGN.md](docs/UI_DESIGN.md)，视觉稿见 `docs/ui_mockup_v2.html`；路线图见 [PRODUCT_PLAN.md](PRODUCT_PLAN.md)。
 
 ## 已实现（M1）
 
