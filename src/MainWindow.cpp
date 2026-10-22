@@ -516,6 +516,26 @@ void MainWindow::CopyPaths(bool nameOnly) {
     CloseClipboard();
 }
 
+void MainWindow::ShowImagePreview() {
+    auto paths = SelectedPaths();
+    if (paths.empty()) return;
+    std::wstring path = paths[0];
+    int fi = list_.FocusedIndex();
+    auto r = list_.Results();
+    if (fi >= 0 && r && static_cast<size_t>(fi) < r->items.size()) {
+        // 焦点行若在选中集合中则用它，否则仍用选中第一项
+        uint32_t idx = r->items[static_cast<size_t>(fi)];
+        auto sel = list_.Selection();
+        if (std::find(sel.begin(), sel.end(), idx) != sel.end())
+            path = r->data->FullPath(idx);
+    }
+    imagePreview_.Show(hwnd_, path);
+}
+
+void MainWindow::HideImagePreview() {
+    imagePreview_.Hide();
+}
+
 void MainWindow::ShowProperties() {
     auto r = list_.Results();
     if (!r) return;
@@ -863,6 +883,11 @@ bool MainWindow::DarkMenuBar(UINT m, WPARAM w, LPARAM l, LRESULT* out) {
 
 // ---------- 键盘 ----------
 bool MainWindow::PreTranslate(MSG& msg) {
+    // 松开空格：关闭图片预览（即使焦点已变也处理，避免 Alt-Tab 丢 KEYUP 前先藏）
+    if (msg.message == WM_KEYUP || msg.message == WM_SYSKEYUP) {
+        if (msg.wParam == VK_SPACE && spacePreviewHeld_) { spacePreviewHeld_ = false; HideImagePreview(); return true; }
+        return false;
+    }
     if (msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN) return false;
     if (renameEdit_ && msg.hwnd == renameEdit_) return false;   // 就地重命名编辑框自己处理按键
     if (msg.hwnd != hwnd_ && GetParent(msg.hwnd) != hwnd_ && GetParent(GetParent(msg.hwnd)) != hwnd_) return false;
@@ -871,6 +896,7 @@ bool MainWindow::PreTranslate(MSG& msg) {
     HWND lv = list_.Hwnd();
 
     if (k == VK_ESCAPE) {
+        if (spacePreviewHeld_ || imagePreview_.Visible()) { spacePreviewHeld_ = false; HideImagePreview(); return true; }
         if (GetWindowTextLengthW(edit_) > 0) { SetWindowTextW(edit_, L""); SetFocus(edit_); }
         else if (GetSettings().escHides) HideToTray();
         return true;
@@ -914,6 +940,10 @@ bool MainWindow::PreTranslate(MSG& msg) {
         }
     } else if (msg.hwnd == lv) {
         if (k == VK_RETURN && alt) { ShowProperties(); return true; }
+        if (k == VK_SPACE && !ctrl && !alt && !shift) {
+            if (!spacePreviewHeld_) { spacePreviewHeld_ = true; ShowImagePreview(); }
+            return true;
+        }
         if (k == VK_RETURN) { OpenItems(ctrl); return true; }
         if (ctrl && shift && k == 'C') { CopyPaths(false); return true; }
         if (k == VK_F2 && !ctrl && !alt) { Rename(); return true; }
@@ -969,7 +999,11 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         return reinterpret_cast<LRESULT>(GetTheme().SurfaceBrush());
     }
     case WM_ACTIVATE:
-        if (LOWORD(w) != WA_INACTIVE) SetFocus(edit_);
+        if (LOWORD(w) == WA_INACTIVE) {
+            if (spacePreviewHeld_) { spacePreviewHeld_ = false; HideImagePreview(); }
+        } else {
+            SetFocus(edit_);
+        }
         return 0;
     case WM_COMMAND: {
         int id = LOWORD(w);

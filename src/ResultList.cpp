@@ -184,6 +184,12 @@ LRESULT CALLBACK ResultList::SubclassProc(HWND h, UINT m, WPARAM w, LPARAM l, UI
         InvalidateRect(h, nullptr, FALSE); UpdateWindow(h);
         return r;
     }
+    // 鼠标改选中：ListView 按内部行矩形局部失效，与自绘行高/顶行可能错位 → 旧高亮残留
+    case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK: case WM_RBUTTONDOWN: {
+        LRESULT r = DefSubclassProc(h, m, w, l);
+        InvalidateRect(h, nullptr, FALSE);
+        return r;
+    }
     case WM_SETFOCUS: case WM_KILLFOCUS: InvalidateRect(h, nullptr, FALSE); break;
     case WM_NOTIFY: {   // 列头通知先到列表本身
         auto* nm = reinterpret_cast<NMHDR*>(l);
@@ -468,6 +474,17 @@ bool ResultList::OnNotify(NMHDR* nm, LRESULT* out) {
         return true;
     }
     case LVN_COLUMNCLICK: *out = 0; return true;   // 已在列表子类化中按 HDN_ITEMCLICK 处理
+    case LVN_ITEMCHANGED: {
+        // 选中/焦点变化：不信任 ListView 局部失效矩形（自绘行几何与内部不一致时会重影）
+        auto* lv = reinterpret_cast<NMLISTVIEW*>(nm);
+        if ((lv->uChanged & LVIF_STATE) &&
+            ((lv->uOldState ^ lv->uNewState) & (LVIS_SELECTED | LVIS_FOCUSED)))
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        *out = 0; return true;
+    }
+    case LVN_ODSTATECHANGED:
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        *out = 0; return true;
     case LVN_ENDSCROLL: InvalidateRect(hwnd_, nullptr, FALSE); *out = 0; return true;
     case LVN_ODFINDITEMW: {   // 键入跳转：名称前缀（折叠比较）
         auto* fi = reinterpret_cast<NMLVFINDITEMW*>(nm);

@@ -48,6 +48,7 @@ add_executable(FlashFind WIN32
     src/FileOps.cpp src/FileOps.h
     src/History.cpp src/History.h
     src/ShellInstall.cpp src/ShellInstall.h
+    src/ImagePreview.cpp src/ImagePreview.h
     src/NtfsSource.cpp src/NtfsSource.h src/Service.cpp
     src/MftIndexer.cpp
     src/Usn.cpp src/Usn.h
@@ -62,7 +63,7 @@ if(MSVC)
     target_link_options(FlashFind PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
     target_link_options(FlashFind PRIVATE /MANIFEST:NO)  # 使用 rc 内嵌的 app.manifest
 endif()
-target_link_libraries(FlashFind PRIVATE pcre2-16-static comctl32 uxtheme dwmapi shell32 shlwapi ole32 d2d1 dwrite cabinet psapi advapi32)
+target_link_libraries(FlashFind PRIVATE pcre2-16-static comctl32 uxtheme dwmapi shell32 shlwapi ole32 windowscodecs msimg32 d2d1 dwrite cabinet psapi advapi32)
 
 # 非管理员自检（-pipetest 需要 NTFS 卷，不纳入 ctest）
 enable_testing()

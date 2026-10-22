@@ -5,6 +5,7 @@
 #include "ResultList.h"
 #include "Search.h"
 #include "Tray.h"
+#include "ImagePreview.h"
 #include <memory>
 #include <shlobj.h>
 
@@ -39,6 +40,8 @@ private:
     void OpenItems(bool openPath);
     void CopyPaths(bool nameOnly);
     void ShowProperties();
+    void ShowImagePreview();
+    void HideImagePreview();
     void ContextMenu(POINT screenPt);
     void TrayMenu();
     void ServiceAction(bool install);
@@ -78,6 +81,8 @@ private:
     double lastSearchMs_ = 0;
     UINT taskbarCreated_ = 0;
     HICON iconBig_ = nullptr, iconSmall_ = nullptr;
+    ImagePreview imagePreview_;
+    bool spacePreviewHeld_ = false;
 };
 
 } // namespace ff
