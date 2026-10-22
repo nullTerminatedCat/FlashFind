@@ -523,22 +523,21 @@ bool MainWindow::ShowImagePreview() {
     int fi = list_.FocusedIndex();
     auto r = list_.Results();
     if (fi >= 0 && r && r->data && static_cast<size_t>(fi) < r->items.size()) {
-        // 焦点行若在选中集合中则预览焦点行，否则预览选中的第一项
         uint32_t idx = r->items[static_cast<size_t>(fi)];
         auto sel = list_.Selection();
         if (std::find(sel.begin(), sel.end(), idx) != sel.end())
             path = r->data->FullPath(idx);
     }
-    // 锚点：选中/焦点行右下角；拿不到则用光标
+    // 锚点：文件名列右侧一点点（NameTextRect 右缘），垂直贴行顶
     POINT anchor{};
     HWND lv = list_.Hwnd();
     int row = list_.FocusedIndex();
     if (row < 0) row = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
-    RECT irc{};
-    if (row >= 0 && ListView_GetItemRect(lv, row, &irc, LVIR_BOUNDS)) {
-        POINT br{irc.right, irc.bottom};
-        ClientToScreen(lv, &br);
-        anchor = br;
+    if (row >= 0) {
+        RECT nr = list_.NameTextRect(row);
+        POINT pt{nr.right, nr.top};
+        ClientToScreen(lv, &pt);
+        anchor = pt;
     } else {
         GetCursorPos(&anchor);
     }
