@@ -1,17 +1,16 @@
 #include "ImagePreview.h"
 #include <wincodec.h>
 #include <algorithm>
-#include <cstdio>
-#include <fstream>
 #include <vector>
 
 #pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "msimg32.lib")
 
 namespace ff {
 namespace {
 
-constexpr size_t kMaxTextBytes = 512 * 1024;   // 超过则只读前缀并提示截断
-constexpr size_t kMaxTextCharsPaint = 120000;  // 绘制上限，避免 GDI 卡死
+constexpr size_t kMaxTextBytes = 256 * 1024;
+constexpr size_t kMaxTextCharsPaint = 6000;   // 小浮层够用，减轻绘制闪烁/卡顿
 
 void FoldAscii(std::wstring& s) {
     for (auto& c : s) if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>(c - L'A' + L'a');
@@ -28,6 +27,18 @@ bool ExtIn(std::wstring_view ext, std::initializer_list<const wchar_t*> list) {
     for (auto x : list) if (e == x) return true;
     return false;
 }
+
+int DpiOf(HWND h) {
+    UINT d = 96;
+    HMODULE u = GetModuleHandleW(L"user32.dll");
+    if (u) {
+        using Fn = UINT (WINAPI*)(HWND);
+        if (auto f = reinterpret_cast<Fn>(GetProcAddress(u, "GetDpiForWindow"))) d = f(h);
+    }
+    return static_cast<int>(d ? d : 96);
+}
+
+int Scale(int v, int dpi) { return MulDiv(v, dpi, 96); }
 
 HBITMAP WicToDib(IWICBitmapSource* src, int& outW, int& outH) {
     UINT w = 0, h = 0;
@@ -60,7 +71,6 @@ HBITMAP WicToDib(IWICBitmapSource* src, int& outW, int& outH) {
     return hbmp;
 }
 
-// 探测编码：UTF-16 LE/BE BOM、UTF-8 BOM、否则当 UTF-8（校验），失败则 CP_ACP
 std::wstring DecodeBytes(const std::vector<char>& raw, bool& truncated) {
     truncated = false;
     if (raw.empty()) return {};
@@ -154,7 +164,6 @@ bool ImagePreview::LoadTextFile(const std::wstring& path) {
         text_.resize(kMaxTextCharsPaint);
         truncFile = true;
     }
-    // 统一换行
     std::wstring norm; norm.reserve(text_.size());
     for (size_t i = 0; i < text_.size(); ++i) {
         wchar_t c = text_[i];
@@ -162,11 +171,51 @@ bool ImagePreview::LoadTextFile(const std::wstring& path) {
         else norm += c;
     }
     text_ = std::move(norm);
-    if (truncFile) text_ += L"\n\n…（文件较大，仅预览开头）";
+    if (truncFile) text_ += L"\n\n…（仅预览开头）";
     return true;
 }
 
-bool ImagePreview::Show(HWND owner, const std::wstring& path) {
+SIZE ImagePreview::MeasureContent(HDC dc, int maxW, int maxH) const {
+    const int pad = 8, titleH = 22;
+    SIZE sz{maxW, maxH};
+    if (isText_) {
+        RECT rc{0, 0, maxW - 2 * pad, maxH - titleH - 2 * pad};
+        HGDIOBJ of = SelectObject(dc, font_ ? font_ : GetStockObject(DEFAULT_GUI_FONT));
+        DrawTextW(dc, text_.c_str(), -1, &rc, DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK | DT_EDITCONTROL | DT_CALCRECT);
+        SelectObject(dc, of);
+        int tw = (std::min)(maxW, (std::max)(160, static_cast<int>(rc.right - rc.left) + 2 * pad));
+        int th = (std::min)(maxH, (std::max)(80, static_cast<int>(rc.bottom - rc.top) + titleH + 2 * pad));
+        sz = {tw, th};
+    } else if (bmp_ && imgW_ > 0 && imgH_ > 0) {
+        int bodyW = maxW - 2 * pad, bodyH = maxH - titleH - 2 * pad;
+        double s = (std::min)(1.0, (std::min)(static_cast<double>(bodyW) / imgW_, static_cast<double>(bodyH) / imgH_));
+        int dw = (std::max)(1, static_cast<int>(imgW_ * s));
+        int dh = (std::max)(1, static_cast<int>(imgH_ * s));
+        sz = {dw + 2 * pad, dh + titleH + 2 * pad};
+    }
+    return sz;
+}
+
+void ImagePreview::PlaceNear(POINT anchor, int w, int h) {
+    HMONITOR mon = MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(mon, &mi);
+    RECT wa = mi.rcWork;
+    const int gap = 6;
+    // 默认锚点右下方（文件/按压位置右下）
+    int x = anchor.x + gap;
+    int y = anchor.y + gap;
+    if (x + w > wa.right) x = anchor.x - gap - w;
+    if (y + h > wa.bottom) y = anchor.y - gap - h;
+    if (x < wa.left) x = wa.left;
+    if (y < wa.top) y = wa.top;
+    if (x + w > wa.right) x = wa.right - w;
+    if (y + h > wa.bottom) y = wa.bottom - h;
+    SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOCOPYBITS);
+}
+
+bool ImagePreview::Show(HWND owner, const std::wstring& path, POINT anchorScreen) {
     Hide();
     owner_ = owner;
     size_t slash = path.find_last_of(L"/\\");
@@ -181,7 +230,6 @@ bool ImagePreview::Show(HWND owner, const std::wstring& path) {
         loaded = LoadTextFile(path);
         isText_ = loaded;
     } else {
-        // 未知扩展名：先试 WIC，再试小文件当文本（≤64KiB）
         if (LoadImageFile(path)) { loaded = true; isText_ = false; }
         else {
             WIN32_FILE_ATTRIBUTE_DATA fad{};
@@ -197,30 +245,39 @@ bool ImagePreview::Show(HWND owner, const std::wstring& path) {
     static ATOM atom = 0;
     if (!atom) {
         WNDCLASSEXW wc{sizeof(wc)};
+        wc.style = CS_DROPSHADOW;
         wc.lpfnWndProc = WndProc;
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = nullptr;
         wc.lpszClassName = L"FlashFindImagePreview";
         atom = RegisterClassExW(&wc);
+        if (!atom) atom = 1;  // 已注册也可 Create
     }
 
-    RECT orc{}; GetWindowRect(owner, &orc);
-    // WS_EX_NOACTIVATE + SW_SHOWNOACTIVATE：浮层不抢激活，否则主窗会收到
-    // WA_INACTIVE 并立刻 Hide，表现为「按空格没效果」。
+    int dpi = DpiOf(owner ? owner : GetDesktopWindow());
+    const int maxW = Scale(isText_ ? 400 : 360, dpi);
+    const int maxH = Scale(280, dpi);
+
+    // 1x1 创建后一次定位置显示，避免大窗闪一下
     hwnd_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
         L"FlashFindImagePreview", L"",
-        WS_POPUP,
-        orc.left, orc.top, orc.right - orc.left, orc.bottom - orc.top,
+        WS_POPUP | WS_BORDER,
+        0, 0, 1, 1,
         owner, nullptr, GetModuleHandleW(nullptr), this);
     if (!hwnd_) { Hide(); return false; }
     SetWindowLongPtrW(hwnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
-    font_ = CreateFontW(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+
+    font_ = CreateFontW(Scale(13, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
     if (!font_) font_ = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    InvalidateRect(hwnd_, nullptr, FALSE);
-    UpdateWindow(hwnd_);
+
+    HDC dc = GetDC(hwnd_);
+    SIZE content = MeasureContent(dc, maxW, maxH);
+    ReleaseDC(hwnd_, dc);
+
+    PlaceNear(anchorScreen, content.cx + 2, content.cy + 2);
+    RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
     return true;
 }
 
@@ -237,43 +294,51 @@ void ImagePreview::Hide() {
 
 void ImagePreview::Paint(HDC dc) {
     RECT rc{}; GetClientRect(hwnd_, &rc);
-    HBRUSH br = CreateSolidBrush(RGB(22, 22, 26));
-    FillRect(dc, &rc, br);
+    HDC mem = CreateCompatibleDC(dc);
+    HBITMAP dib = CreateCompatibleBitmap(dc, rc.right - rc.left, rc.bottom - rc.top);
+    HGDIOBJ oldBmp = SelectObject(mem, dib);
+
+    HBRUSH br = CreateSolidBrush(RGB(32, 32, 36));
+    FillRect(mem, &rc, br);
     DeleteObject(br);
 
-    // 顶栏标题
-    RECT titleRc{rc.left + 16, rc.top + 8, rc.right - 16, rc.top + 36};
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(180, 180, 190));
-    HFONT ui = CreateFontW(16, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    HGDIOBJ oldF = SelectObject(dc, ui ? ui : GetStockObject(DEFAULT_GUI_FONT));
-    DrawTextW(dc, title_.c_str(), -1, &titleRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-    SelectObject(dc, oldF);
+    const int pad = 8, titleH = 22;
+    RECT titleRc{rc.left + pad, rc.top + 4, rc.right - pad, rc.top + titleH};
+    SetBkMode(mem, TRANSPARENT);
+    SetTextColor(mem, RGB(170, 170, 180));
+    HFONT ui = CreateFontW(14, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    HGDIOBJ oldF = SelectObject(mem, ui ? ui : GetStockObject(DEFAULT_GUI_FONT));
+    DrawTextW(mem, title_.c_str(), -1, &titleRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SelectObject(mem, oldF);
     if (ui) DeleteObject(ui);
 
-    RECT body{rc.left + 16, rc.top + 44, rc.right - 16, rc.bottom - 16};
+    RECT body{rc.left + pad, rc.top + titleH, rc.right - pad, rc.bottom - pad};
 
     if (isText_) {
-        SetTextColor(dc, RGB(230, 230, 235));
-        HGDIOBJ of = SelectObject(dc, font_ ? font_ : GetStockObject(DEFAULT_GUI_FONT));
-        DrawTextW(dc, text_.c_str(), -1, &body, DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK | DT_EDITCONTROL);
-        SelectObject(dc, of);
-        return;
+        SetTextColor(mem, RGB(230, 230, 235));
+        HGDIOBJ of = SelectObject(mem, font_ ? font_ : GetStockObject(DEFAULT_GUI_FONT));
+        DrawTextW(mem, text_.c_str(), -1, &body, DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK | DT_EDITCONTROL);
+        SelectObject(mem, of);
+    } else if (bmp_ && imgW_ > 0 && imgH_ > 0) {
+        int maxW = (std::max)(1, static_cast<int>(body.right - body.left));
+        int maxH = (std::max)(1, static_cast<int>(body.bottom - body.top));
+        double s = (std::min)(1.0, (std::min)(static_cast<double>(maxW) / imgW_, static_cast<double>(maxH) / imgH_));
+        int dw = (std::max)(1, static_cast<int>(imgW_ * s));
+        int dh = (std::max)(1, static_cast<int>(imgH_ * s));
+        int dx = body.left + (maxW - dw) / 2, dy = body.top + (maxH - dh) / 2;
+        HDC img = CreateCompatibleDC(mem);
+        HGDIOBJ old = SelectObject(img, bmp_);
+        SetStretchBltMode(mem, HALFTONE);
+        SetBrushOrgEx(mem, 0, 0, nullptr);
+        BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        AlphaBlend(mem, dx, dy, dw, dh, img, 0, 0, imgW_, imgH_, bf);
+        SelectObject(img, old);
+        DeleteDC(img);
     }
-    if (!bmp_ || imgW_ <= 0 || imgH_ <= 0) return;
-    int maxW = (std::max)(1, static_cast<int>(body.right - body.left)), maxH = (std::max)(1, static_cast<int>(body.bottom - body.top));
-    double sx = static_cast<double>(maxW) / imgW_, sy = static_cast<double>(maxH) / imgH_;
-    double s = (std::min)(1.0, (std::min)(sx, sy));
-    int dw = (std::max)(1, static_cast<int>(imgW_ * s));
-    int dh = (std::max)(1, static_cast<int>(imgH_ * s));
-    int dx = body.left + (maxW - dw) / 2, dy = body.top + (maxH - dh) / 2;
-    HDC mem = CreateCompatibleDC(dc);
-    HGDIOBJ old = SelectObject(mem, bmp_);
-    SetStretchBltMode(dc, HALFTONE);
-    SetBrushOrgEx(dc, 0, 0, nullptr);
-    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    AlphaBlend(dc, dx, dy, dw, dh, mem, 0, 0, imgW_, imgH_, bf);
-    SelectObject(mem, old);
+
+    BitBlt(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, oldBmp);
+    DeleteObject(dib);
     DeleteDC(mem);
 }
 

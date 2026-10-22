@@ -529,7 +529,20 @@ bool MainWindow::ShowImagePreview() {
         if (std::find(sel.begin(), sel.end(), idx) != sel.end())
             path = r->data->FullPath(idx);
     }
-    return imagePreview_.Show(hwnd_, path);
+    // 锚点：选中/焦点行右下角；拿不到则用光标
+    POINT anchor{};
+    HWND lv = list_.Hwnd();
+    int row = list_.FocusedIndex();
+    if (row < 0) row = ListView_GetNextItem(lv, -1, LVNI_SELECTED);
+    RECT irc{};
+    if (row >= 0 && ListView_GetItemRect(lv, row, &irc, LVIR_BOUNDS)) {
+        POINT br{irc.right, irc.bottom};
+        ClientToScreen(lv, &br);
+        anchor = br;
+    } else {
+        GetCursorPos(&anchor);
+    }
+    return imagePreview_.Show(hwnd_, path, anchor);
 }
 
 void MainWindow::HideImagePreview() {
