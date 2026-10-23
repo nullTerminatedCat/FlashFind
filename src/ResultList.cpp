@@ -244,6 +244,18 @@ void ResultList::SetFont(HFONT f, HFONT bold, int rowHeight) {
 }
 
 void ResultList::SetResults(std::shared_ptr<SearchResult> r) {
+    // LVS_OWNERDATA：SetItemCount 会丢掉选中。同索引快照下按「条目 id」恢复选中，
+    // 避免防抖/排序/后台刷新再次 SetResults 时多选被清掉，并误跳回顶部像「一滚动就取消选中」。
+    std::unordered_set<uint32_t> keep;
+    uint32_t focusEntry = UINT32_MAX;
+    const bool sameData = res_ && r && res_->data && r->data && res_->data.get() == r->data.get();
+    if (sameData) {
+        for (uint32_t e : Selection()) keep.insert(e);
+        int fi = FocusedIndex();
+        if (fi >= 0 && static_cast<size_t>(fi) < res_->items.size())
+            focusEntry = res_->items[static_cast<size_t>(fi)];
+    }
+
     {   // 旧结果的图标请求不再需要
         std::lock_guard lk(iconMu_);
         for (auto& p : iconQ_) iconPending_.erase(p);
@@ -251,9 +263,30 @@ void ResultList::SetResults(std::shared_ptr<SearchResult> r) {
     }
     res_ = std::move(r);
     int n = res_ ? static_cast<int>(res_->items.size()) : 0;
-    ListView_SetItemState(hwnd_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
     ListView_SetItemCountEx(hwnd_, n, LVSICF_NOSCROLL);
-    if (n) ListView_EnsureVisible(hwnd_, 0, FALSE);
+
+    int restored = 0, focusRow = -1;
+    if (res_ && !keep.empty()) {
+        for (int row = 0; row < n; ++row) {
+            uint32_t e = res_->items[static_cast<size_t>(row)];
+            if (!keep.count(e)) continue;
+            ListView_SetItemState(hwnd_, row, LVIS_SELECTED, LVIS_SELECTED);
+            ++restored;
+            if (e == focusEntry) focusRow = row;
+        }
+        if (focusRow >= 0) {
+            ListView_SetItemState(hwnd_, focusRow, LVIS_FOCUSED, LVIS_FOCUSED);
+        } else if (restored > 0) {
+            int firstSel = ListView_GetNextItem(hwnd_, -1, LVNI_SELECTED);
+            if (firstSel >= 0) {
+                ListView_SetItemState(hwnd_, firstSel, LVIS_FOCUSED, LVIS_FOCUSED);
+            }
+        }
+    }
+    if (restored == 0) {
+        ListView_SetItemState(hwnd_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+        if (n) ListView_EnsureVisible(hwnd_, 0, FALSE);
+    }
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
