@@ -30,6 +30,7 @@ private:
     void BuildMenu();
     void StartIndex(bool force);
     void RunSearch();
+    void ScheduleSearch();   // 输入防抖
     void UpdateStatus();
     void UpdateTitle();
 
@@ -83,6 +84,8 @@ private:
     HICON iconBig_ = nullptr, iconSmall_ = nullptr;
     ImagePreview imagePreview_;
     bool spacePreviewHeld_ = false;
+    static constexpr UINT_PTR kSearchTimerId = 42;
+    static constexpr UINT kSearchDebounceMs = 50;
 };
 
 } // namespace ff

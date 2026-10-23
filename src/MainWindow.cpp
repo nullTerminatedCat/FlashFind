@@ -369,6 +369,7 @@ void MainWindow::StartIndex(bool force) {
 }
 
 void MainWindow::RunSearch() {
+    if (hwnd_) KillTimer(hwnd_, kSearchTimerId);
     UpdateTitle();
     auto snap = indexer_.Snapshot();
     if (!snap) return;   // 索引未就绪：丢弃本次刷新，就绪后 WM_APP_INDEX_DONE 会重新搜索
@@ -380,6 +381,13 @@ void MainWindow::RunSearch() {
     auto& st = GetSettings();
     MatchOpts o; o.matchCase = st.matchCase; o.matchWholeWord = st.matchWholeWord; o.matchPath = st.matchPath; o.matchRegex = st.matchRegex;
     searcher_->Request(q, std::move(snap), list_.Sort(), o, fx);
+}
+
+void MainWindow::ScheduleSearch() {
+    // 标题即时刷新；搜索请求 50ms 防抖，连打字时少触发编译/扫描（Searcher 虽有 gen_ 取消，仍省调度与 CPU）
+    UpdateTitle();
+    if (!hwnd_) return;
+    SetTimer(hwnd_, kSearchTimerId, kSearchDebounceMs, nullptr);
 }
 
 void MainWindow::UpdateTitle() {
@@ -397,9 +405,15 @@ void MainWindow::UpdateStatus() {
         s = WithThousands(r->items.size()) + L" 个对象";
         int sel = list_.SelectedCount();
         if (sel > 0) {
-            unsigned long long total = 0;
-            for (auto i : list_.Selection()) total += r->data->entries[i].size;
-            s += L"  ·  已选 " + WithThousands(static_cast<size_t>(sel)) + L" 个，" + FormatSize(total);
+            // 全选大量结果时逐条累加体积会卡住 UI；超过阈值只显示个数
+            constexpr int kMaxSizeSum = 2000;
+            if (sel <= kMaxSizeSum) {
+                unsigned long long total = 0;
+                for (auto i : list_.Selection()) total += r->data->entries[i].size;
+                s += L"  ·  已选 " + WithThousands(static_cast<size_t>(sel)) + L" 个，" + FormatSize(total);
+            } else {
+                s += L"  ·  已选 " + WithThousands(static_cast<size_t>(sel)) + L" 个";
+            }
         }
         wchar_t ms[48]; swprintf_s(ms, L"  ·  %.0f ms", lastSearchMs_);
         s += ms;
@@ -1024,6 +1038,9 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
             SetFocus(edit_);
         }
         return 0;
+    case WM_TIMER:
+        if (w == kSearchTimerId) { KillTimer(hwnd_, kSearchTimerId); RunSearch(); }
+        return 0;
     case WM_COMMAND: {
         int id = LOWORD(w);
         if (id == IDC_FILTER) {
@@ -1031,7 +1048,7 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         if (id == IDC_SEARCH) {
-            if (HIWORD(w) == EN_CHANGE) RunSearch();
+            if (HIWORD(w) == EN_CHANGE) ScheduleSearch();
             if (HIWORD(w) == EN_SETFOCUS || HIWORD(w) == EN_KILLFOCUS) InvalidateRect(hwnd_, &searchRc_, FALSE);
             return 0;
         }

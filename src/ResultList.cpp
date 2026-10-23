@@ -175,13 +175,13 @@ LRESULT CALLBACK ResultList::SubclassProc(HWND h, UINT m, WPARAM w, LPARAM l, UI
     case WM_VSCROLL: case WM_HSCROLL: case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL: case LVM_SCROLL: case LVM_ENSUREVISIBLE: {
         int top = ListView_GetTopIndex(h); int hx = GetScrollPos(h, SB_HORZ);
         LRESULT r = DefSubclassProc(h, m, w, l);
-        if (top != ListView_GetTopIndex(h) || hx != GetScrollPos(h, SB_HORZ)) { InvalidateRect(h, nullptr, FALSE); UpdateWindow(h); }
+        if (top != ListView_GetTopIndex(h) || hx != GetScrollPos(h, SB_HORZ)) InvalidateRect(h, nullptr, FALSE);
         return r;
     }
     case WM_KEYDOWN: {
-        // 键盘导航：选择/焦点与滚动同时变化时 ListView 只失效部分行；整块重画（约 1.8 ms）
+        // 选中高亮：Invalidate 即可（与 ListView 局部失效错位）；勿 UpdateWindow，否则方向键连按时同步全表重绘卡顿
         LRESULT r = DefSubclassProc(h, m, w, l);
-        InvalidateRect(h, nullptr, FALSE); UpdateWindow(h);
+        InvalidateRect(h, nullptr, FALSE);
         return r;
     }
     // 鼠标改选中：ListView 按内部行矩形局部失效，与自绘行高/顶行可能错位 → 旧高亮残留
