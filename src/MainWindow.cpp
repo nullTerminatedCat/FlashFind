@@ -924,7 +924,7 @@ bool MainWindow::PreTranslate(MSG& msg) {
     if (ctrl && !shift && k == 'U') { PostMessageW(hwnd_, WM_COMMAND, IDM_MATCHPATH, 0); return true; }
     if (ctrl && !shift && k == 'X' && msg.hwnd == list_.Hwnd()) { PostMessageW(hwnd_, WM_COMMAND, IDM_CUT, 0); return true; }
     if (ctrl && !shift && k == 'C' && msg.hwnd == list_.Hwnd()) { PostMessageW(hwnd_, WM_COMMAND, IDM_COPY_FILES, 0); return true; }
-    if (ctrl && !shift && k == 'V') { PostMessageW(hwnd_, WM_COMMAND, IDM_PASTE, 0); return true; }
+    if (ctrl && !shift && k == 'V' && msg.hwnd == list_.Hwnd()) { PostMessageW(hwnd_, WM_COMMAND, IDM_PASTE, 0); return true; }
 
     if (msg.hwnd == edit_) {
         if (ctrl && k == 'A') { SendMessageW(edit_, EM_SETSEL, 0, -1); return true; }
