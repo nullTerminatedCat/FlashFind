@@ -24,6 +24,7 @@
 #include "Options.h"
 #include "Hotkey.h"
 #include "Log.h"
+#include "../tests/OptimizationTests.h"
 
 namespace ff {
 
@@ -179,7 +180,10 @@ static int IncrTest(std::wstring dbPath) {
     LiveUpdater upd(base);
     upd.SetFilter(0, {pathX}, {});
     double ta = NowMs();
-    upd.Apply(0, parsed, nullptr);
+    // 修改时间来自元数据查询；USN TimeStamp 是事件时间，不能冒充文件最后写入时间。
+    upd.Apply(0, parsed, [&](uint32_t, const std::vector<uint64_t>& frns, std::vector<LookupResult>& out) {
+        out.assign(frns.size(), LookupResult{0, 1, 0, static_cast<uint64_t>(now)});
+    });
     auto snap = upd.Commit();
     double totalMs = NowMs() - ta;
     auto s1 = upd.LastStats();
@@ -986,6 +990,7 @@ int App::Run(HINSTANCE inst, int show) {
         if (wcsstr(GetCommandLineW(), L"-debug-log")) g_debugLog = true;
         if (mode.size() > 5 && mode.compare(mode.size() - 4, 4, L"test") == 0) InstallCrashDiag();
         if (mode == L"-svc") return ServiceMain();
+        if (mode == L"-optimizationtest") return OptimizationTest(arg == L"-bench");
         if (mode == L"-svc-console") return SvcConsole();
         if (mode == L"-install-service") return InstallService();
         if (mode == L"-uninstall-service") return UninstallService();

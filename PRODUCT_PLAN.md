@@ -1,6 +1,6 @@
 # 闪寻 FlashFind 产品计划
 
-定位：Everything 1.4 的开源式替代，原生 Win32，零第三方依赖，界面现代化（Fluent），支持 Win10 / Win11。
+定位：Everything 1.4 的开源式替代，原生 Win32，静态链接 PCRE2，界面现代化（Fluent），支持 Win10 / Win11。
 
 ## 已定技术决策
 
@@ -9,7 +9,7 @@
 | 语言 / 构建 | C++20，CMake + MSVC（Ninja），静态 CRT |
 | 界面 | 原生 Win32 + comctl32 v6；自绘用 Direct2D / DirectWrite；保留系统标题栏（DWM 深色） |
 | 系统 | Win10 + Win11；Mica / 圆角仅 Win11，Win10 实色回退 |
-| 索引 | 后台 Windows 服务读取 NTFS MFT + USN Journal，界面通过命名管道通信；无服务时回退文件夹遍历 |
+| 索引 | 后台 Windows 服务读取 NTFS MFT + USN Journal，界面通过命名管道通信；普通权限无服务时保留已有 NTFS 缓存并提示 |
 | 热键 | Ctrl+Alt+Space 切换 + 双击 Ctrl（WH_KEYBOARD_LL），v1 均提供 |
 | 推迟 | HTTP / ETP 服务器、ReFS、文件内容搜索、缩略图 |
 

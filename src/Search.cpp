@@ -59,11 +59,11 @@ template <bool A> bool WholeWordMatch(std::wstring_view s, std::wstring_view lit
 }
 
 // 迭代式贪心 + 单回溯点（无递归）：最坏 O(n*m)，常见情况线性
-template <bool A> bool GlobMatch(std::wstring_view s, std::wstring_view p) {
+template <bool A> bool GlobMatch(std::wstring_view s, std::wstring_view p, bool caseSens) {
     size_t i = 0, j = 0, star = SIZE_MAX, mark = 0;
     const size_t n = s.size(), m = p.size();
     while (i < n) {
-        if (j < m && p[j] != L'*' && (p[j] == L'?' || p[j] == F<A>(s[i]))) { ++i; ++j; }
+        if (j < m && p[j] != L'*' && (p[j] == L'?' || p[j] == (caseSens ? s[i] : F<A>(s[i])))) { ++i; ++j; }
         else if (j < m && p[j] == L'*') { star = j++; mark = i; }
         else if (star != SIZE_MAX) { j = star + 1; i = ++mark; }
         else return false;
@@ -116,7 +116,7 @@ template <bool A> inline bool MatchT(std::wstring_view s, const Pattern& p) {
     case PatKind::Suffix: return s.size() >= p.b.size() && EqAt<A>(s.data() + s.size() - p.b.size(), p.b, cs);
     case PatKind::PrefixSuffix:
         return s.size() >= p.a.size() + p.b.size() && EqAt<A>(s.data() + s.size() - p.b.size(), p.b, cs) && EqAt<A>(s.data(), p.a, cs);
-    case PatKind::Glob: return GlobMatch<A>(s, p.a);  // Glob 模式内容已按 caseSens 折叠或原样
+    case PatKind::Glob: return GlobMatch<A>(s, p.a, cs);
     }
     return false;
 }
@@ -566,8 +566,13 @@ std::vector<uint32_t> BuildFolderPathRank(const IndexData& d) {
     return rank;
 }
 
-void SortItems(const IndexData& d, std::vector<uint32_t>& items, SortSpec s, const std::vector<uint32_t>* folderRank) {
+void SortItems(const IndexData& d, std::vector<uint32_t>& items, SortSpec s,
+               const std::vector<uint32_t>* folderRank, bool nameOrdered) {
     const size_t n = items.size();
+    if (s.col == SortCol::Name && nameOrdered) {
+        if (s.desc) std::reverse(items.begin(), items.end());
+        return;
+    }
     // 名称：不假设输入已按名称排列；键 = 该对象在 byName（CompareFold 排好的全局名称序）中的位置
     std::vector<uint32_t> namePos;
     if (s.col == SortCol::Name && n * 64 < d.byName.size()) {   // 结果少：直接比较名称（与 byName 同序：折叠比较，同名按 id）
@@ -671,7 +676,8 @@ void Searcher::Loop() {
         }
         if (so.col == SortCol::Path && rankFor_ != d.get()) { rank_ = BuildFolderPathRank(*d); rankFor_ = d.get(); rankHold_ = d; }
         if (gen_ != g) continue;
-        SortItems(*d, res->items, so, so.col == SortCol::Path ? &rank_ : nullptr);
+        // lastItems_ 缓存排序前的匹配结果；新搜索和仅切换排序均保持 byName 顺序。
+        SortItems(*d, res->items, so, so.col == SortCol::Path ? &rank_ : nullptr, true);
         res->elapsedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         { std::lock_guard lk(mu_); if (g != gen_) continue; latest_ = res; }
         if (hwnd_) PostMessageW(hwnd_, WM_APP_RESULTS, static_cast<WPARAM>(g), 0);

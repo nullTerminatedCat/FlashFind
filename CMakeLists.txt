@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(FlashFind VERSION 0.3.3 LANGUAGES C CXX RC)
+project(FlashFind VERSION 0.3.4 LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -52,6 +52,7 @@ add_executable(FlashFind WIN32
     src/NtfsSource.cpp src/NtfsSource.h src/Service.cpp
     src/MftIndexer.cpp
     src/Usn.cpp src/Usn.h
+    tests/OptimizationTests.cpp tests/OptimizationTests.h
     resources/FlashFind.rc
 )
 
@@ -74,3 +75,4 @@ add_test(NAME sorttest COMMAND FlashFind -sorttest ${CMAKE_BINARY_DIR}/no_such.d
 add_test(NAME syntaxtest COMMAND FlashFind -syntaxtest ${CMAKE_BINARY_DIR}/no_such.db)
 add_test(NAME regextest COMMAND FlashFind -regextest ${CMAKE_BINARY_DIR}/no_such.db)
 add_test(NAME incrtest_synthetic COMMAND FlashFind -incrtest ${CMAKE_BINARY_DIR}/no_such.db)
+add_test(NAME optimizationtest COMMAND FlashFind -optimizationtest)

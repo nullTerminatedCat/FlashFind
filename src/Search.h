@@ -11,8 +11,10 @@ struct SortSpec { SortCol col = SortCol::Name; bool desc = false; bool operator=
 
 // 文件夹按路径的先序排名（子项按名称排序的深度优先序）：O(n)，每个快照只算一次
 std::vector<uint32_t> BuildFolderPathRank(const IndexData& d);
-// items 须为名称顺序（SearchCore 的输出）；按列排序，同键保持名称顺序。多线程分块排序 + 归并。
-void SortItems(const IndexData& d, std::vector<uint32_t>& items, SortSpec s, const std::vector<uint32_t>* folderRank);
+// nameOrdered=true：输入是 SearchQuery/SearchCore 的名称升序输出（含同名 id 顺序）。
+// 名称排序直接复用/反转；其他列多线程分块排序 + 归并，同键保持输入顺序。
+void SortItems(const IndexData& d, std::vector<uint32_t>& items, SortSpec s,
+               const std::vector<uint32_t>* folderRank, bool nameOrdered = false);
 
 // 匹配开关（搜索菜单）；编译进 Query，影响所有 Pat/Regex 节点
 struct MatchOpts {

@@ -173,10 +173,13 @@ void LiveUpdater::ScanMovedIn(uint32_t vol, uint32_t dirIdx) {
         const Entry& s = vd.entries[i];
         uint32_t p = s.parent < map.size() ? map[s.parent] : kNoParent;
         if (p == kNoParent) continue;
+        std::wstring nm(vd.names.data() + s.nameOff, s.nameLen);
+        // 扫描器不一定知道 includeOnly；沿用 USN 单条更新的完整过滤规则。
+        // 不映射被过滤的目录，后续子项也就不会进入索引。
+        if (Filtered(vol, p, nm, s.IsDir())) { ++st_.dropped; continue; }
         uint64_t frn = i < vd.frn.size() ? vd.frn[i] : 0;
         size_t ex = frn ? Find(vol, frn) : SIZE_MAX;
         if (ex != SIZE_MAX) { map[i] = static_cast<uint32_t>(ex); continue; }   // 已在索引中（之后的 USN 记录先到）
-        std::wstring nm(vd.names.data() + s.nameOff, s.nameLen);
         uint32_t ni = AddEntry(vol, nm, p, s.IsDir(), static_cast<int64_t>(s.mtime), frn);
         work_->entries.Mut(ni).size = s.size;
         map[i] = ni;
@@ -226,6 +229,7 @@ bool LiveUpdater::Filtered(uint32_t vol, uint32_t parent, const std::wstring& na
 }
 
 void LiveUpdater::Apply(uint32_t vol, const std::vector<UsnEvent>& ev, const Lookup& lookup) {
+    if (ev.empty()) return;   // 空日志批次无需建立全库 FRN / 子树索引
     auto t = Clock::now();
     EnsureFrnIndex(vol);
     std::vector<uint32_t> need;
@@ -287,25 +291,28 @@ void LiveUpdater::Apply(uint32_t vol, const std::vector<UsnEvent>& ev, const Loo
         }
         // MODIFY（含 USN_REASON_HARD_LINK_CHANGE：一个 FRN 一个对象，保留现有名称）
         ++st_.modifies;
-        if (r & (USN_REASON_DATA_OVERWRITE | USN_REASON_DATA_EXTEND | USN_REASON_DATA_TRUNCATION)) {
-            EnsureWork();
-            work_->entries.Mut(idx).mtime = static_cast<uint64_t>(e.time);
+        if (r & (USN_REASON_DATA_OVERWRITE | USN_REASON_DATA_EXTEND | USN_REASON_DATA_TRUNCATION | USN_REASON_BASIC_INFO_CHANGE))
             need.push_back(static_cast<uint32_t>(idx));
-        } else if (r & USN_REASON_BASIC_INFO_CHANGE) need.push_back(static_cast<uint32_t>(idx));
     }
-    if (lookup && !need.empty() && work_) {
+    if (lookup && !need.empty()) {
         std::sort(need.begin(), need.end()); need.erase(std::unique(need.begin(), need.end()), need.end());
-        need.erase(std::remove_if(need.begin(), need.end(), [&](uint32_t i) { return work_->entries[i].IsDeleted(); }), need.end());
+        const IndexData& d = work_ ? *work_ : *base_;
+        need.erase(std::remove_if(need.begin(), need.end(), [&](uint32_t i) { return d.entries[i].IsDeleted(); }), need.end());
         std::vector<uint64_t> frns; frns.reserve(need.size());
-        for (uint32_t i : need) frns.push_back(work_->frn[i]);
+        for (uint32_t i : need) frns.push_back(d.frn[i]);
         std::vector<LookupResult> res;
-        lookup(vol, frns, res);
+        if (!frns.empty()) lookup(vol, frns, res);
         st_.lookups += frns.size();
         for (size_t k = 0; k < need.size() && k < res.size(); ++k) {
-            if (!res[k].sizeOk && !res[k].timeOk) continue;   // 全部失败：保留旧值
+            const Entry& old = (work_ ? *work_ : *base_).entries[need[k]];
+            const bool sizeChanged = res[k].sizeOk && !old.IsDir() && old.size != res[k].size;
+            const bool timeChanged = res[k].timeOk && old.mtime != res[k].mtime;
+            if (!sizeChanged && !timeChanged) continue;
+            // 元数据单独变化也要发布；实际值相同时不复制块、不合并、不触发整库保存。
+            EnsureWork();
             Entry& x = work_->entries.Mut(need[k]);
-            if (res[k].sizeOk && !x.IsDir()) x.size = res[k].size;
-            if (res[k].timeOk && res[k].mtime) x.mtime = res[k].mtime;
+            if (sizeChanged) x.size = res[k].size;
+            if (timeChanged) x.mtime = res[k].mtime;
         }
     }
     st_.applyMs += Ms(t);

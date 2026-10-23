@@ -1,14 +1,16 @@
 # 闪寻 FlashFind
 
-Windows 上的极速文件名搜索工具，交互参考 voidtools Everything 1.4。原生 Win32 + C++20，只依赖 Windows SDK（不用 Qt / MFC / 第三方库），单个 `FlashFind.exe`。
+Windows 上的极速文件名搜索工具，交互参考 voidtools Everything 1.4。原生 Win32 + C++20，使用 Windows SDK 与静态链接的 PCRE2，单个 `FlashFind.exe`，无需另装运行库。
 
-> 当前版本：**0.3.3（粘贴修复、预览体验、输入防抖）**。界面设计见 [docs/UI_DESIGN.md](docs/UI_DESIGN.md)，视觉稿见 `docs/ui_mockup_v2.html`；路线图见 [PRODUCT_PLAN.md](PRODUCT_PLAN.md)。
+> 当前版本：**0.3.4（名称排序提速、增量更新修复）**。更新与性能实测见 [发布说明](docs/RELEASE_0.3.4.md)。界面设计见 [docs/UI_DESIGN.md](docs/UI_DESIGN.md)，路线图见 [PRODUCT_PLAN.md](PRODUCT_PLAN.md)。
 
-## 已实现（M1）
+## 主要功能
 
 - 主窗口：搜索框 + 虚拟列表（`LVS_OWNERDATA`，百万行）+ 自绘状态栏；列：名称 / 路径 / 大小 / 修改时间。
 - 输入即搜：后台线程搜索，新输入自动取消旧搜索；空格分隔多个词（AND），`"..."` 短语，含 `\` 的词匹配完整路径；不区分大小写；匹配词高亮。
-- 进程内索引：启动时后台遍历所有固定磁盘（不跟随联接点，可配置排除目录），完成后按名称预排序。
+- 磁盘缓存：启动先加载上次索引；NTFS 通过服务或管理员权限读取 MFT，并按卷追踪 USN 增量。缺少权限时保留旧数据并提示安装服务。
+- 增量更新：按批处理创建、删除、改名与大小/修改时间变化；支持按卷设置监视、USN Journal、仅包含目录及全局排除目录。
+- 名称结果复用索引中的顺序，切换降序只需反转；也支持按路径、扩展名、大小、修改时间排序。
 - 结果操作：Enter 打开、Ctrl+Enter 打开所在位置并选中、双击打开、右键菜单（打开 / 打开路径 / 复制完整路径 / 复制名称 / 属性）、Ctrl+Shift+C 复制路径、键入名称跳转。
 - 全局热键 **Ctrl+Alt+Space** 切换显示/隐藏（被占用时托盘气泡 + 状态栏红字提示）；**双击 Ctrl** 切换（`WH_KEYBOARD_LL`，可在“工具”菜单关闭）。
 - 显示时移动到鼠标所在显示器、聚焦并全选搜索框；Esc 先清空、再隐藏到托盘；关闭按钮隐藏到托盘；托盘左键切换、右键菜单。
@@ -41,7 +43,7 @@ cmake --build build\Release
 | Ctrl+Shift+C | 复制完整路径 |
 | Ctrl+F / F3 / Alt+D | 聚焦搜索框 |
 | Esc | 清空搜索；为空时隐藏到托盘 |
-| F5 | 重建索引 |
+| F5 / Ctrl+F5 | 刷新当前结果与选中项属性 / 重建索引 |
 | Ctrl+W / Ctrl+Q | 隐藏 / 退出 |
 
 ## ini 示例
@@ -64,23 +66,23 @@ src/
   main.cpp App.*          入口、单实例、消息循环
   MainWindow.*            主窗口、布局、菜单、快捷键、托盘/热键分发、结果操作
   ResultList.*            虚拟 ListView、自绘（隔行/选中强调条/匹配高亮）
-  Index.*                 进程内文件夹遍历索引（M1）
+  Index.* Db.* Usn.*       快照、缓存、USN 增量更新与目录过滤
   Search.*                后台搜索线程
   Settings.*              ini 读写
   Theme.*                 浅/深色调色板、DWM（深色标题栏、Mica、圆角）
   Tray.*  Hotkey.*        托盘图标；全局热键 + 双击 Ctrl
-  ServiceClient.*         [桩] 命名管道客户端（M3）
-  MftIndexer.*            [桩] NTFS MFT + USN 索引器（M3）
+  NtfsSource.* Service.*   命名管道客户端、特权读取与服务管理
+  MftIndexer.*            NTFS MFT + USN 索引器
+tests/                    优化回归测试、排序性能基准
 resources/                app.manifest、图标、版本信息
 docs/                     UI 设计、原型
 ```
 
-## 已知限制（M1）
+## 已知限制
 
-- 索引在每次启动时重新遍历，不持久化，不监视变化（F5 手动重建）；大盘首次需要几十秒到数分钟。
-- 普通文件按扩展名取图标（exe/lnk 无专属图标）。
-- 只能按名称排序；无过滤器、书签、高级搜索、选项对话框。
-- 菜单栏在深色模式下仍为浅色（Win32 限制，计划 M2 处理）。
+- NTFS 首次建立与实时更新需要服务或管理员权限；未安装服务的普通权限进程只能使用已有缓存。
+- 同一 FRN 当前保留一个名称，尚未索引全部硬链接路径。
+- 暂不支持 ReFS 原生索引、文件内容搜索、HTTP / ETP 服务器。
 
 ## 通配符
 
@@ -98,6 +100,8 @@ docs/                     UI 设计、原型
 
 ```powershell
 ctest --test-dir build\Release --output-on-failure   # -initest、-incrtest（无数据库时使用合成的 226 万对象）
+FlashFind.exe -optimizationtest                      # 元数据、目录过滤、通配符与排序缓存回归
+FlashFind.exe -optimizationtest -bench               # 226 万对象；优化前后同数据、同结果的排序基准
 FlashFind.exe -pipetest G:                            # 启动 -svc-console 测试管道协议（需要 NTFS 卷）
 ```
 

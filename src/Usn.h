@@ -24,7 +24,7 @@ void EncodeUsnRecord(std::vector<uint8_t>& buf, const UsnEvent& e);
 
 class LiveUpdater {
 public:
-    // 批量取大小/时间（服务或管理员：FSCTL_GET_NTFS_FILE_RECORD）；为空则只用记录时间戳
+    // 批量取大小/时间（服务或管理员：FSCTL_GET_NTFS_FILE_RECORD）；查询失败保留已有元数据。
     using Lookup = std::function<void(uint32_t vol, const std::vector<uint64_t>& frns, std::vector<LookupResult>& out)>;
     // 扫描一个目录（移入索引范围的文件夹）：out.entries[0] 为该目录本身，其余为子树（带 FRN）
     using Scanner = std::function<bool(uint32_t vol, const std::wstring& path, VolumeData& out)>;
