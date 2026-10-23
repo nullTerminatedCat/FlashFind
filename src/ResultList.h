@@ -30,6 +30,9 @@ public:
     int SelectedCount() const;
     std::vector<uint32_t> Selection() const;
     int FocusedIndex() const;
+    void SelectAll();
+    // F5：对当前结果集（有上限）从磁盘刷新 size/mtime 覆盖显示；不改索引结构
+    void RefreshAttrsFromDisk(int maxItems = 8000);
     std::vector<int> ColumnWidths() const;   // 逻辑像素；隐藏列返回记住的宽度
     bool ColumnVisible(int c) const { return c == ColName || GetSettingsVisible(c); }
     void SetColumnVisible(int c, bool v);
@@ -48,6 +51,11 @@ private:
     static bool WantsRealIcon(std::wstring_view ext);
     static bool GetSettingsVisible(int c);
     void UpdateHiddenColumns();
+    void SyncSelFromNotify(int row, UINT oldSt, UINT newSt);
+    void SyncSelRange(int from, int to, UINT oldSt, UINT newSt);
+    void ApplySelToListView();
+    uint64_t DisplaySize(uint32_t entry) const;
+    uint64_t DisplayMtime(uint32_t entry) const;
 
     HWND hwnd_ = nullptr;
     SortSpec sort_; int sortClicks_ = 0; int lastDblCol_ = -1; ULONGLONG lastDblTick_ = 0;
@@ -70,6 +78,12 @@ private:
     int rowH_ = 26;
     HDC memDc_ = nullptr; HBITMAP memBmp_ = nullptr; HGDIOBJ memOld_ = nullptr; int memW_ = 0, memH_ = 0;
     HIMAGELIST rowHeightIl_ = nullptr;
+    // 自持选中位图：LVS_OWNERDATA + 自绘下 GetItemState 在滚动后不可靠；以 sel_ 为准绘制/查询
+    std::vector<uint8_t> sel_;
+    int focusRow_ = -1;
+    bool applyingSel_ = false;  // ApplySelToListView 期间忽略 LVN 回写，避免清空 sel_
+    struct AttrOv { uint64_t size = 0, mtime = 0; };
+    std::unordered_map<uint32_t, AttrOv> attrOv_;   // entry id -> 磁盘刷新覆盖
 };
 
 } // namespace ff

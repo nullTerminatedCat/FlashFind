@@ -244,61 +244,149 @@ void ResultList::SetFont(HFONT f, HFONT bold, int rowHeight) {
 }
 
 void ResultList::SetResults(std::shared_ptr<SearchResult> r) {
-    // LVS_OWNERDATA：SetItemCount 会丢掉选中。同索引快照下按「条目 id」恢复选中，
-    // 避免防抖/排序/后台刷新再次 SetResults 时多选被清掉，并误跳回顶部像「一滚动就取消选中」。
     std::unordered_set<uint32_t> keep;
     uint32_t focusEntry = UINT32_MAX;
-    const bool sameData = res_ && r && res_->data && r->data && res_->data.get() == r->data.get();
-    if (sameData) {
-        for (uint32_t e : Selection()) keep.insert(e);
-        int fi = FocusedIndex();
-        if (fi >= 0 && static_cast<size_t>(fi) < res_->items.size())
-            focusEntry = res_->items[static_cast<size_t>(fi)];
+    if (res_ && !sel_.empty()) {
+        for (size_t row = 0; row < sel_.size() && row < res_->items.size(); ++row)
+            if (sel_[row]) keep.insert(res_->items[row]);
+        if (focusRow_ >= 0 && static_cast<size_t>(focusRow_) < res_->items.size())
+            focusEntry = res_->items[static_cast<size_t>(focusRow_)];
     }
 
-    {   // 旧结果的图标请求不再需要
+    {
         std::lock_guard lk(iconMu_);
-        for (auto& p : iconQ_) iconPending_.erase(p);
+        for (auto& pth : iconQ_) iconPending_.erase(pth);
         iconQ_.clear();
     }
     res_ = std::move(r);
+    // 保留仍出现在新结果中的磁盘覆盖（F5 软刷新后索引重搜不应丢掉刚读的 size/mtime）
+    if (!attrOv_.empty()) {
+        if (!res_ || !res_->data) attrOv_.clear();
+        else {
+            std::unordered_set<uint32_t> alive(res_->items.begin(), res_->items.end());
+            for (auto it = attrOv_.begin(); it != attrOv_.end(); ) {
+                if (!alive.count(it->first)) it = attrOv_.erase(it);
+                else ++it;
+            }
+        }
+    }
     int n = res_ ? static_cast<int>(res_->items.size()) : 0;
+    sel_.assign(static_cast<size_t>((std::max)(0, n)), 0);
+    focusRow_ = -1;
     ListView_SetItemCountEx(hwnd_, n, LVSICF_NOSCROLL);
 
-    int restored = 0, focusRow = -1;
+    int restored = 0;
     if (res_ && !keep.empty()) {
         for (int row = 0; row < n; ++row) {
             uint32_t e = res_->items[static_cast<size_t>(row)];
             if (!keep.count(e)) continue;
-            ListView_SetItemState(hwnd_, row, LVIS_SELECTED, LVIS_SELECTED);
+            sel_[static_cast<size_t>(row)] = 1;
             ++restored;
-            if (e == focusEntry) focusRow = row;
+            if (e == focusEntry) focusRow_ = row;
         }
-        if (focusRow >= 0) {
-            ListView_SetItemState(hwnd_, focusRow, LVIS_FOCUSED, LVIS_FOCUSED);
-        } else if (restored > 0) {
-            int firstSel = ListView_GetNextItem(hwnd_, -1, LVNI_SELECTED);
-            if (firstSel >= 0) {
-                ListView_SetItemState(hwnd_, firstSel, LVIS_FOCUSED, LVIS_FOCUSED);
-            }
+        if (focusRow_ < 0 && restored > 0) {
+            for (int row = 0; row < n; ++row)
+                if (sel_[static_cast<size_t>(row)]) { focusRow_ = row; break; }
         }
-    }
-    if (restored == 0) {
+        ApplySelToListView();
+    } else {
         ListView_SetItemState(hwnd_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
         if (n) ListView_EnsureVisible(hwnd_, 0, FALSE);
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
-int ResultList::SelectedCount() const { return ListView_GetSelectedCount(hwnd_); }
-int ResultList::FocusedIndex() const { return ListView_GetNextItem(hwnd_, -1, LVNI_FOCUSED); }
+int ResultList::SelectedCount() const {
+    int c = 0;
+    for (uint8_t v : sel_) if (v) ++c;
+    return c;
+}
+
+int ResultList::FocusedIndex() const { return focusRow_; }
 
 std::vector<uint32_t> ResultList::Selection() const {
-    std::vector<uint32_t> r;
-    if (!res_) return r;
-    for (int i = ListView_GetNextItem(hwnd_, -1, LVNI_SELECTED); i >= 0; i = ListView_GetNextItem(hwnd_, i, LVNI_SELECTED))
-        r.push_back(res_->items[static_cast<size_t>(i)]);
-    return r;
+    std::vector<uint32_t> out;
+    if (!res_) return out;
+    out.reserve(static_cast<size_t>(SelectedCount()));
+    for (size_t i = 0; i < sel_.size() && i < res_->items.size(); ++i)
+        if (sel_[i]) out.push_back(res_->items[i]);
+    return out;
+}
+
+void ResultList::SelectAll() {
+    if (sel_.empty()) return;
+    std::fill(sel_.begin(), sel_.end(), static_cast<uint8_t>(1));
+    if (focusRow_ < 0) focusRow_ = 0;
+    ApplySelToListView();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void ResultList::SyncSelFromNotify(int row, UINT oldSt, UINT newSt) {
+    if (applyingSel_) return;
+    if (row < 0 || static_cast<size_t>(row) >= sel_.size()) return;
+    if ((oldSt ^ newSt) & LVIS_SELECTED)
+        sel_[static_cast<size_t>(row)] = (newSt & LVIS_SELECTED) ? 1 : 0;
+    if ((oldSt ^ newSt) & LVIS_FOCUSED) {
+        if (newSt & LVIS_FOCUSED) focusRow_ = row;
+        else if (focusRow_ == row) focusRow_ = -1;
+    }
+}
+
+void ResultList::SyncSelRange(int from, int to, UINT oldSt, UINT newSt) {
+    if (applyingSel_) return;
+    if (sel_.empty() || from < 0) return;
+    int a = from, b = to;
+    if (b < a) std::swap(a, b);
+    if (a >= static_cast<int>(sel_.size())) return;
+    b = (std::min)(b, static_cast<int>(sel_.size()) - 1);
+    if ((oldSt ^ newSt) & LVIS_SELECTED) {
+        const uint8_t v = (newSt & LVIS_SELECTED) ? 1 : 0;
+        for (int i = a; i <= b; ++i) sel_[static_cast<size_t>(i)] = v;
+    }
+}
+
+void ResultList::ApplySelToListView() {
+    // ListView_SetItemState 会触发 LVN_ITEMCHANGED/ODSTATECHANGED；若同步回写会把 sel_ 清掉再遍历空位图。
+    applyingSel_ = true;
+    ListView_SetItemState(hwnd_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    for (size_t i = 0; i < sel_.size(); ++i) {
+        if (!sel_[i]) continue;
+        ListView_SetItemState(hwnd_, static_cast<int>(i), LVIS_SELECTED, LVIS_SELECTED);
+    }
+    if (focusRow_ >= 0 && static_cast<size_t>(focusRow_) < sel_.size()) {
+        UINT st = LVIS_FOCUSED | (sel_[static_cast<size_t>(focusRow_)] ? LVIS_SELECTED : 0);
+        ListView_SetItemState(hwnd_, focusRow_, st, LVIS_FOCUSED | LVIS_SELECTED);
+    }
+    applyingSel_ = false;
+}
+
+uint64_t ResultList::DisplaySize(uint32_t entry) const {
+    auto it = attrOv_.find(entry);
+    if (it != attrOv_.end()) return it->second.size;
+    return res_ && res_->data ? res_->data->entries[entry].size : 0;
+}
+
+uint64_t ResultList::DisplayMtime(uint32_t entry) const {
+    auto it = attrOv_.find(entry);
+    if (it != attrOv_.end()) return it->second.mtime;
+    return res_ && res_->data ? res_->data->entries[entry].mtime : 0;
+}
+
+void ResultList::RefreshAttrsFromDisk(int maxItems) {
+    if (!res_ || !res_->data || maxItems <= 0) return;
+    const size_t n = (std::min)(res_->items.size(), static_cast<size_t>(maxItems));
+    for (size_t k = 0; k < n; ++k) {
+        uint32_t id = res_->items[k];
+        if (res_->data->entries[id].IsDir()) continue;
+        std::wstring path = res_->data->FullPath(id);
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) continue;
+        if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        ULARGE_INTEGER sz; sz.HighPart = fad.nFileSizeHigh; sz.LowPart = fad.nFileSizeLow;
+        ULARGE_INTEGER mt; mt.HighPart = fad.ftLastWriteTime.dwHighDateTime; mt.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+        attrOv_[id] = AttrOv{sz.QuadPart, mt.QuadPart};
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 int ResultList::IconFor(uint32_t i) {
@@ -389,7 +477,7 @@ void ResultList::DrawRow(HDC dc, int row, const RECT& rr, const RECT* cols, bool
     uint32_t i = res_->items[static_cast<size_t>(row)];
     const auto& d = *res_->data;
     const auto& e = d.entries[i];
-    bool sel = ListView_GetItemState(hwnd_, row, LVIS_SELECTED) != 0;
+    bool sel = row >= 0 && static_cast<size_t>(row) < sel_.size() && sel_[static_cast<size_t>(row)] != 0;
     COLORREF bg = sel ? (focused ? pal.sel : pal.hover) : ((row & 1) ? pal.alt : pal.surface);
     SetBkColor(dc, bg);
     ExtTextOutW(dc, 0, 0, ETO_OPAQUE, &rr, nullptr, 0, nullptr);
@@ -422,8 +510,8 @@ void ResultList::DrawRow(HDC dc, int row, const RECT& rr, const RECT* cols, bool
                     wmemcpy(rowBuf_, nm.data() + dot + 1, n); rowBuf_[n] = 0; len = static_cast<int>(n);
                 }
             }
-        } else if (c == ColSize) len = e.IsDir() ? 0 : FormatSizeInto(e.size, rowBuf_, kRowBuf);
-        else if (c == ColDate) len = FormatTimeInto(e.mtime, rowBuf_, kRowBuf);
+        } else if (c == ColSize) len = e.IsDir() ? 0 : FormatSizeInto(DisplaySize(i), rowBuf_, kRowBuf);
+        else if (c == ColDate) len = FormatTimeInto(DisplayMtime(i), rowBuf_, kRowBuf);
         RECT t{r.left + pad, r.top, r.right - pad, r.bottom};
         SetTextColor(dc, pal.text2);
         DrawTextW(dc, rowBuf_, len, &t, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS | (c == ColSize ? DT_RIGHT : DT_LEFT));
@@ -508,16 +596,20 @@ bool ResultList::OnNotify(NMHDR* nm, LRESULT* out) {
     }
     case LVN_COLUMNCLICK: *out = 0; return true;   // 已在列表子类化中按 HDN_ITEMCLICK 处理
     case LVN_ITEMCHANGED: {
-        // 选中/焦点变化：不信任 ListView 局部失效矩形（自绘行几何与内部不一致时会重影）
         auto* lv = reinterpret_cast<NMLISTVIEW*>(nm);
         if ((lv->uChanged & LVIF_STATE) &&
-            ((lv->uOldState ^ lv->uNewState) & (LVIS_SELECTED | LVIS_FOCUSED)))
+            ((lv->uOldState ^ lv->uNewState) & (LVIS_SELECTED | LVIS_FOCUSED))) {
+            SyncSelFromNotify(lv->iItem, lv->uOldState, lv->uNewState);
             InvalidateRect(hwnd_, nullptr, FALSE);
+        }
         *out = 0; return true;
     }
-    case LVN_ODSTATECHANGED:
+    case LVN_ODSTATECHANGED: {
+        auto* od = reinterpret_cast<NMLVODSTATECHANGE*>(nm);
+        SyncSelRange(od->iFrom, od->iTo, od->uOldState, od->uNewState);
         InvalidateRect(hwnd_, nullptr, FALSE);
         *out = 0; return true;
+    }
     case LVN_ENDSCROLL: InvalidateRect(hwnd_, nullptr, FALSE); *out = 0; return true;
     case LVN_ODFINDITEMW: {   // 键入跳转：名称前缀（折叠比较）
         auto* fi = reinterpret_cast<NMLVFINDITEMW*>(nm);

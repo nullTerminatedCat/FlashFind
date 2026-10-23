@@ -29,6 +29,7 @@ private:
     void Paint();
     void BuildMenu();
     void StartIndex(bool force);
+    void Refresh();   // F5：磁盘属性覆盖 + 增量索引
     void RunSearch();
     void ScheduleSearch();   // 输入防抖
     void UpdateStatus();
@@ -74,6 +75,7 @@ private:
     std::unique_ptr<Searcher> searcher_;
     Tray tray_;
     bool noteShown_ = false;
+    bool softRefreshPending_ = false;  // F5：索引重搜后再刷一遍磁盘属性
     HotkeyManager hotkeys_;
     bool hotkeyFailed_ = false;
     HFONT font_ = nullptr, bold_ = nullptr;

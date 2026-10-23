@@ -21,7 +21,7 @@ namespace ff {
 
 enum : int {
     IDC_SEARCH = 100, IDC_LIST, IDC_FILTER,
-    IDM_EXIT = 1000, IDM_REINDEX, IDM_THEME_SYSTEM, IDM_THEME_LIGHT, IDM_THEME_DARK,
+    IDM_EXIT = 1000, IDM_REINDEX, IDM_REFRESH, IDM_THEME_SYSTEM, IDM_THEME_LIGHT, IDM_THEME_DARK,
     IDM_ABOUT, IDM_SHOW, IDM_OPEN, IDM_OPEN_PATH, IDM_COPY_PATH, IDM_COPY_NAME, IDM_PROPERTIES,
     IDM_DOUBLE_CTRL,
     IDM_INSTALL_SVC,
@@ -170,7 +170,8 @@ void MainWindow::ServiceAction(bool install) {
 void MainWindow::BuildMenu() {
     HMENU bar = CreateMenu();
     HMENU file = CreatePopupMenu();
-    AppendMenuW(file, MF_STRING, IDM_REINDEX, L"重建索引(&R)\tF5");
+    AppendMenuW(file, MF_STRING, IDM_REFRESH, L"刷新(&F)\tF5");
+    AppendMenuW(file, MF_STRING, IDM_REINDEX, L"重建索引(&R)\tCtrl+F5");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, IDM_EXIT, L"退出(&X)\tCtrl+Q");
     HMENU view = CreatePopupMenu();
@@ -366,6 +367,21 @@ void MainWindow::StartIndex(bool force) {
     // TODO(服务): 需要特权的 MFT 读取将来交给服务进程；目前当前进程已提升时直接读取
     indexer_.Start(hwnd_, std::move(o));
     UpdateStatus();
+}
+
+
+void MainWindow::Refresh() {
+    // F5 软刷新（非全量重建）：
+    // 1) 对当前结果集从磁盘读 size/mtime 覆盖显示（立刻可见）
+    // 2) 用现有快照重搜（监控线程可能已写入 USN 变更）
+    // 3) StartIndex(false) 再推一把增量；完成后 RESULTS 里再刷一遍磁盘属性
+    // 全量重建：Ctrl+F5 / 菜单「重建索引」→ StartIndex(true)
+    softRefreshPending_ = true;
+    list_.RefreshAttrsFromDisk();
+    InvalidateRect(list_.Hwnd(), nullptr, FALSE);
+    UpdateStatus();
+    RunSearch();
+    StartIndex(false);
 }
 
 void MainWindow::RunSearch() {
@@ -655,6 +671,7 @@ void MainWindow::ContextMenu(POINT pt) {
 void MainWindow::TrayMenu() {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, IDM_SHOW, L"显示闪寻(&S)");
+    AppendMenuW(m, MF_STRING, IDM_REFRESH, L"刷新(&F)");
     AppendMenuW(m, MF_STRING, IDM_REINDEX, L"重建索引(&R)");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"退出(&X)");
@@ -928,7 +945,12 @@ bool MainWindow::PreTranslate(MSG& msg) {
         return true;
     }
     if ((ctrl && k == 'F') || k == VK_F3 || (alt && k == 'D')) { SetFocus(edit_); SendMessageW(edit_, EM_SETSEL, 0, -1); return true; }
-    if (k == VK_F5) { StartIndex(true); return true; }
+    if (k == VK_F5) {
+        if (ctrl) StartIndex(true);
+        else Refresh();
+        return true;
+    }
+    if (ctrl && k == 'A' && msg.hwnd == list_.Hwnd()) { list_.SelectAll(); return true; }
     if (ctrl && k == 'Q') { DestroyWindow(hwnd_); return true; }
     if (ctrl && k == 'P') { PostMessageW(hwnd_, WM_COMMAND, IDM_OPTIONS, 0); return true; }
     if (ctrl && k == 'W') { HideToTray(); return true; }
@@ -1054,6 +1076,7 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         }
         switch (id) {
         case IDM_EXIT: DestroyWindow(hwnd_); break;
+        case IDM_REFRESH: Refresh(); break;
         case IDM_REINDEX: StartIndex(true); break;
         case IDM_THEME_SYSTEM: case IDM_THEME_LIGHT: case IDM_THEME_DARK:
             GetSettings().theme = static_cast<ThemeMode>(id - IDM_THEME_SYSTEM); ApplyTheme(); break;
@@ -1152,6 +1175,10 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         if (r && r->generation == static_cast<uint64_t>(w)) {
             lastSearchMs_ = r->elapsedMs;
             list_.SetResults(r);
+            if (softRefreshPending_) {
+                softRefreshPending_ = false;
+                list_.RefreshAttrsFromDisk();
+            }
             UpdateStatus();
         }
         return 0;
