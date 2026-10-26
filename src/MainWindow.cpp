@@ -940,6 +940,7 @@ bool MainWindow::PreTranslate(MSG& msg) {
 
     if (k == VK_ESCAPE) {
         if (spacePreviewHeld_ || imagePreview_.Visible()) { spacePreviewHeld_ = false; HideImagePreview(); return true; }
+        if (list_.SelectedCount() > 0) { list_.ClearSelection(); return true; }
         if (GetWindowTextLengthW(edit_) > 0) { SetWindowTextW(edit_, L""); SetFocus(edit_); }
         else if (GetSettings().escHides) HideToTray();
         return true;

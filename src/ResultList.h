@@ -31,6 +31,7 @@ public:
     std::vector<uint32_t> Selection() const;
     int FocusedIndex() const;
     void SelectAll();
+    void ClearSelection();
     // F5：对当前结果集（有上限）从磁盘刷新 size/mtime 覆盖显示；不改索引结构
     void RefreshAttrsFromDisk(int maxItems = 8000);
     std::vector<int> ColumnWidths() const;   // 逻辑像素；隐藏列返回记住的宽度

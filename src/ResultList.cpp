@@ -321,6 +321,14 @@ void ResultList::SelectAll() {
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
+void ResultList::ClearSelection() {
+    if (sel_.empty()) return;
+    std::fill(sel_.begin(), sel_.end(), static_cast<uint8_t>(0));
+    // 保留焦点行（便于方向键继续移动），仅去掉选中高亮
+    ApplySelToListView();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
 void ResultList::SyncSelFromNotify(int row, UINT oldSt, UINT newSt) {
     if (applyingSel_) return;
     if (row < 0 || static_cast<size_t>(row) >= sel_.size()) return;
