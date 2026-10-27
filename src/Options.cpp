@@ -127,7 +127,7 @@ void Dlg::Build() {
     SendMessageW(hk, HKM_SETHOTKEY, MAKEWORD(static_cast<BYTE>(def.vk), ModToHkf(def.mods)), 0);
     Ctl(1, WC_STATICW, L"", 0, L, T + 62, 460, 40, IDC_HK_STATUS);
     chk(1, L"双击 Ctrl 显示/隐藏窗口", T + 110, IDC_DOUBLE_CTRL, work_.doubleCtrl);
-    Ctl(1, WC_STATICW, L"窗口内快捷键：Enter 打开，Ctrl+Enter 打开路径，Ctrl+Shift+C 复制完整路径，Alt+Enter 属性；结果列表中按住空格预览图片/文本（文件名旁小窗）；搜索框 Ctrl+V 粘贴文字，列表中 Ctrl+V 粘贴文件；F5 重建索引，Esc 隐藏。", 0, L, T + 150, 470, 60, -1);
+    Ctl(1, WC_STATICW, L"窗口内快捷键：Enter 打开，Ctrl+Enter 打开路径，Ctrl+Shift+C 复制完整路径，Alt+Enter 属性；列表按住空格预览图片/文本；搜索框 Ctrl+V 粘贴文字，列表 Ctrl+V 粘贴文件；Ctrl+A 全选；F5 刷新（Ctrl+F5 重建索引）；Esc 取消选中→清搜索→隐藏。", 0, L, T + 150, 470, 60, -1);
     // NTFS 卷
     Ctl(2, WC_STATICW, L"卷：", 0, L, T, 60, 22, -1);
     HWND vl = Ctl(2, WC_LISTBOXW, L"", WS_BORDER | WS_VSCROLL | LBS_NOTIFY | WS_TABSTOP, L, T + 24, 150, 260, IDC_VOLS);

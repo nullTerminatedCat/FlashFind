@@ -237,6 +237,18 @@ void MainWindow::UpdateFonts() {
     Layout();
 }
 
+void MainWindow::SyncMenuFlags() {
+    HMENU bar = GetMenu(hwnd_);
+    if (!bar) return;
+    auto& st = GetSettings();
+    CheckMenuItem(bar, IDM_CASE, MF_BYCOMMAND | (st.matchCase ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_WHOLEWORD, MF_BYCOMMAND | (st.matchWholeWord ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_MATCHPATH, MF_BYCOMMAND | (st.matchPath ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_REGEX, MF_BYCOMMAND | (st.matchRegex ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_HISTORY_ENABLE, MF_BYCOMMAND | (st.historyEnabled ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(bar, IDM_DOUBLE_CTRL, MF_BYCOMMAND | (GetSettings().doubleCtrl ? MF_CHECKED : MF_UNCHECKED));
+}
+
 void MainWindow::ApplyTheme() {
     auto& t = GetTheme();
     t.Resolve(GetSettings().theme);
@@ -418,7 +430,12 @@ void MainWindow::UpdateStatus() {
     std::wstring s;
     auto r = list_.Results();
     if (r && r->data) {
-        s = WithThousands(r->items.size()) + L" 个对象";
+        if (r->items.empty()) {
+            int qlen = edit_ ? GetWindowTextLengthW(edit_) : 0;
+            s = qlen > 0 ? L"无匹配" : L"暂无结果";
+        } else {
+            s = WithThousands(r->items.size()) + L" 个对象";
+        }
         int sel = list_.SelectedCount();
         if (sel > 0) {
             // 全选大量结果时逐条累加体积会卡住 UI；超过阈值只显示个数
@@ -431,13 +448,16 @@ void MainWindow::UpdateStatus() {
                 s += L"  ·  已选 " + WithThousands(static_cast<size_t>(sel)) + L" 个";
             }
         }
-        wchar_t ms[48]; swprintf_s(ms, L"  ·  %.0f ms", lastSearchMs_);
-        s += ms;
-        auto& st = GetSettings();
-        if (st.matchCase) s += L"  ·  区分大小写";
-        if (st.matchWholeWord) s += L"  ·  全字";
-        if (st.matchPath) s += L"  ·  路径";
-        if (st.matchRegex) s += L"  ·  正则";
+        // 空结果且无关键字时不追加耗时/开关，避免噪音
+        if (!(r->items.empty() && edit_ && GetWindowTextLengthW(edit_) == 0)) {
+            wchar_t ms[48]; swprintf_s(ms, L"  ·  %.0f ms", lastSearchMs_);
+            s += ms;
+            auto& st = GetSettings();
+            if (st.matchCase) s += L"  ·  区分大小写";
+            if (st.matchWholeWord) s += L"  ·  全字";
+            if (st.matchPath) s += L"  ·  路径";
+            if (st.matchRegex) s += L"  ·  正则";
+        }
         if (!r->error.empty()) s = L"⚠ " + r->error;
     }
     std::wstring phase;
@@ -940,7 +960,7 @@ bool MainWindow::PreTranslate(MSG& msg) {
 
     if (k == VK_ESCAPE) {
         if (spacePreviewHeld_ || imagePreview_.Visible()) { spacePreviewHeld_ = false; HideImagePreview(); return true; }
-        if (list_.SelectedCount() > 0) { list_.ClearSelection(); return true; }
+        if (list_.SelectedCount() > 0) { list_.ClearSelection(); UpdateStatus(); return true; }
         if (GetWindowTextLengthW(edit_) > 0) { SetWindowTextW(edit_, L""); SetFocus(edit_); }
         else if (GetSettings().escHides) HideToTray();
         return true;
@@ -951,7 +971,7 @@ bool MainWindow::PreTranslate(MSG& msg) {
         else Refresh();
         return true;
     }
-    if (ctrl && k == 'A' && msg.hwnd == list_.Hwnd()) { list_.SelectAll(); return true; }
+    if (ctrl && k == 'A' && msg.hwnd == list_.Hwnd()) { list_.SelectAll(); UpdateStatus(); return true; }
     if (ctrl && k == 'Q') { DestroyWindow(hwnd_); return true; }
     if (ctrl && k == 'P') { PostMessageW(hwnd_, WM_COMMAND, IDM_OPTIONS, 0); return true; }
     if (ctrl && k == 'W') { HideToTray(); return true; }
@@ -1000,7 +1020,6 @@ bool MainWindow::PreTranslate(MSG& msg) {
         if (ctrl && shift && k == 'C') { CopyPaths(false); return true; }
         if (k == VK_F2 && !ctrl && !alt) { Rename(); return true; }
         if (k == VK_DELETE && !ctrl && !alt) { Delete(shift); return true; }
-        if (ctrl && k == 'A') { ListView_SetItemState(lv, -1, LVIS_SELECTED, LVIS_SELECTED); return true; }
         if (k == VK_UP && ListView_GetNextItem(lv, -1, LVNI_FOCUSED) == 0 && !shift) { SetFocus(edit_); return true; }
         if (k == VK_APPS || (shift && k == VK_F10)) {
             int f = list_.FocusedIndex(); RECT r{};
@@ -1107,11 +1126,11 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
             int c = (id == IDM_COL_PATH) ? ColPath : (id == IDM_COL_EXT) ? ColExt : (id == IDM_COL_SIZE) ? ColSize : ColDate;
             list_.SetColumnVisible(c, !list_.ColumnVisible(c)); ApplyTheme(); break;
         }
-        case IDM_CASE: GetSettings().matchCase = !GetSettings().matchCase; ApplyTheme(); RunSearch(); break;
-        case IDM_WHOLEWORD: GetSettings().matchWholeWord = !GetSettings().matchWholeWord; ApplyTheme(); RunSearch(); break;
-        case IDM_MATCHPATH: GetSettings().matchPath = !GetSettings().matchPath; ApplyTheme(); RunSearch(); break;
-        case IDM_REGEX: GetSettings().matchRegex = !GetSettings().matchRegex; ApplyTheme(); RunSearch(); break;
-        case IDM_HISTORY_ENABLE: GetSettings().historyEnabled = !GetSettings().historyEnabled; ApplyTheme(); break;
+        case IDM_CASE: GetSettings().matchCase = !GetSettings().matchCase; SyncMenuFlags(); UpdateStatus(); RunSearch(); break;
+        case IDM_WHOLEWORD: GetSettings().matchWholeWord = !GetSettings().matchWholeWord; SyncMenuFlags(); UpdateStatus(); RunSearch(); break;
+        case IDM_MATCHPATH: GetSettings().matchPath = !GetSettings().matchPath; SyncMenuFlags(); UpdateStatus(); RunSearch(); break;
+        case IDM_REGEX: GetSettings().matchRegex = !GetSettings().matchRegex; SyncMenuFlags(); UpdateStatus(); RunSearch(); break;
+        case IDM_HISTORY_ENABLE: GetSettings().historyEnabled = !GetSettings().historyEnabled; SyncMenuFlags(); break;
         case IDM_CLEAR_HISTORY: ClearSearchHistory(); break;
         case IDM_CUT: ClipboardFiles(true); break;
         case IDM_COPY_FILES: ClipboardFiles(false); break;
@@ -1135,7 +1154,10 @@ LRESULT MainWindow::Handle(UINT m, WPARAM w, LPARAM l) {
         case IDM_ABOUT: {
             std::wstring t = std::wstring(L"闪寻 FlashFind ") + FLASHFIND_VERSION +
                 L"\n\n极速文件名搜索（原生 Win32，无第三方依赖）。\n\n"
-                L"全局热键：" + GetSettings().toggleKey + L" 或双击 Ctrl 显示/隐藏。\n配置文件：" + GetSettings().IniPath();
+                L"全局热键：" + GetSettings().toggleKey + L" 或双击 Ctrl 显示/隐藏。\n"
+                L"常用：F5 刷新，Ctrl+F5 重建索引，Esc 取消选中/清搜索，Ctrl+A 全选，\n"
+                L"空格预览，Enter 打开，Ctrl+Enter 打开路径。\n\n"
+                L"配置文件：" + GetSettings().IniPath();
             MessageBoxW(hwnd_, t.c_str(), L"关于闪寻", MB_OK | MB_ICONINFORMATION);
             break;
         }

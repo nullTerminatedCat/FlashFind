@@ -317,15 +317,22 @@ void ResultList::SelectAll() {
     if (sel_.empty()) return;
     std::fill(sel_.begin(), sel_.end(), static_cast<uint8_t>(1));
     if (focusRow_ < 0) focusRow_ = 0;
-    ApplySelToListView();
+    // 大数据量时逐条 SetItemState 会卡 UI；OWNERDATA 支持一次全选
+    applyingSel_ = true;
+    ListView_SetItemState(hwnd_, -1, LVIS_SELECTED, LVIS_SELECTED);
+    ListView_SetItemState(hwnd_, focusRow_, LVIS_FOCUSED | LVIS_SELECTED, LVIS_FOCUSED | LVIS_SELECTED);
+    applyingSel_ = false;
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void ResultList::ClearSelection() {
     if (sel_.empty()) return;
     std::fill(sel_.begin(), sel_.end(), static_cast<uint8_t>(0));
-    // 保留焦点行（便于方向键继续移动），仅去掉选中高亮
-    ApplySelToListView();
+    applyingSel_ = true;
+    ListView_SetItemState(hwnd_, -1, 0, LVIS_SELECTED);
+    if (focusRow_ >= 0 && static_cast<size_t>(focusRow_) < sel_.size())
+        ListView_SetItemState(hwnd_, focusRow_, LVIS_FOCUSED, LVIS_FOCUSED);
+    applyingSel_ = false;
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -354,12 +361,19 @@ void ResultList::SyncSelRange(int from, int to, UINT oldSt, UINT newSt) {
 }
 
 void ResultList::ApplySelToListView() {
-    // ListView_SetItemState 会触发 LVN_ITEMCHANGED/ODSTATECHANGED；若同步回写会把 sel_ 清掉再遍历空位图。
+    // ListView_SetItemState 会触发 LVN；applyingSel_ 期间忽略回写，避免清空 sel_。
     applyingSel_ = true;
     ListView_SetItemState(hwnd_, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
-    for (size_t i = 0; i < sel_.size(); ++i) {
-        if (!sel_[i]) continue;
-        ListView_SetItemState(hwnd_, static_cast<int>(i), LVIS_SELECTED, LVIS_SELECTED);
+    int nSel = 0;
+    for (uint8_t v : sel_) if (v) ++nSel;
+    if (nSel > 0 && nSel == static_cast<int>(sel_.size())) {
+        ListView_SetItemState(hwnd_, -1, LVIS_SELECTED, LVIS_SELECTED);
+    } else if (nSel > 0) {
+        // 稀疏选中：逐条同步（恢复选中场景）；全选已走上面的 -1
+        for (size_t i = 0; i < sel_.size(); ++i) {
+            if (!sel_[i]) continue;
+            ListView_SetItemState(hwnd_, static_cast<int>(i), LVIS_SELECTED, LVIS_SELECTED);
+        }
     }
     if (focusRow_ >= 0 && static_cast<size_t>(focusRow_) < sel_.size()) {
         UINT st = LVIS_FOCUSED | (sel_[static_cast<size_t>(focusRow_)] ? LVIS_SELECTED : 0);

@@ -26,6 +26,7 @@ private:
     void Layout();
     void UpdateFonts();
     void ApplyTheme();
+    void SyncMenuFlags();
     void Paint();
     void BuildMenu();
     void StartIndex(bool force);
