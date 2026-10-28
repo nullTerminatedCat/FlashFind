@@ -432,7 +432,9 @@ void MainWindow::UpdateStatus() {
     if (r && r->data) {
         if (r->items.empty()) {
             int qlen = edit_ ? GetWindowTextLengthW(edit_) : 0;
-            s = qlen > 0 ? L"无匹配" : L"暂无结果";
+            // 有关键字 → 无匹配；索引未就绪/空库占位 → 正在准备索引…
+            if (qlen > 0) s = L"无匹配";
+            else s = indexer_.Ready() ? L"暂无结果" : L"正在准备索引…";
         } else {
             s = WithThousands(r->items.size()) + L" 个对象";
         }
@@ -448,7 +450,7 @@ void MainWindow::UpdateStatus() {
                 s += L"  ·  已选 " + WithThousands(static_cast<size_t>(sel)) + L" 个";
             }
         }
-        // 空结果且无关键字时不追加耗时/开关，避免噪音
+        // 空结果且无关键字（准备索引/空库提示）时不追加耗时/开关
         if (!(r->items.empty() && edit_ && GetWindowTextLengthW(edit_) == 0)) {
             wchar_t ms[48]; swprintf_s(ms, L"  ·  %.0f ms", lastSearchMs_);
             s += ms;
@@ -459,6 +461,8 @@ void MainWindow::UpdateStatus() {
             if (st.matchRegex) s += L"  ·  正则";
         }
         if (!r->error.empty()) s = L"⚠ " + r->error;
+    } else if (!indexer_.Ready()) {
+        s = L"正在准备索引…";
     }
     std::wstring phase;
     switch (indexer_.Phase()) {
